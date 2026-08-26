@@ -1042,7 +1042,7 @@ static __device__ __forceinline__ int gk_cu_e2m1_quad(int w, int shift) {
 #define GK_CU_MMA_TILE_N_OF(wn)      (GK_CU_MMA_WARPS_N * (wn))
 
 template <int WARPS_M, int WN>
-static __global__ __launch_bounds__(GK_CU_MMA_THREADS(WARPS_M), 1)
+static __global__ __launch_bounds__(GK_CU_MMA_THREADS(WARPS_M), 2)
 void gk_cu_k_mul_mat_mma_nvfp4(gk_tview a, gk_tview_mut d,
                                const gk_cu_q8blk * aq, int64_t n_grp,
                                int64_t r2, int64_t r3) {
@@ -1050,19 +1050,25 @@ void gk_cu_k_mul_mat_mma_nvfp4(gk_tview a, gk_tview_mut d,
     constexpr int TILE_N = GK_CU_MMA_TILE_N_OF(WN);
     constexpr int WNT    = WN / 8;   // mma column tiles a warp owns
 
-    // Staging is one thread per row and one per column, so the two together
-    // are the block - which is what keeps the wide tile from needing a strided
-    // staging loop, exactly as in `mma-q8`.
-    static_assert(TILE_M + TILE_N == GK_CU_MMA_THREADS(WARPS_M),
-                  "staging assumes one thread per staged row and column");
+    // Staging is one whole nvfp4 block of k - 64 elements - per round rather
+    // than the 32 the mma windows walk, which halves the barriers and reads
+    // each weight row's 36-byte block in one go. Every thread stages half a
+    // row *and* half a column: the row half carries the e2m1 decode and the
+    // column half is a plain copy, so splitting both across all threads keeps
+    // the critical path balanced instead of making the row threads the wait.
+    static_assert(TILE_M == TILE_N && 2 * TILE_M == GK_CU_MMA_THREADS(WARPS_M),
+                  "staging assumes two threads per staged row and per column");
 
     // Staged as ints rather than bytes so that the fragment reads below are
-    // plain aligned loads: word `h*4 + tig` is exactly the four codes a lane
-    // wants for half `h`.
-    __shared__ int   As[TILE_M][8];
-    __shared__ int   Bs[TILE_N][8];
-    __shared__ float Ws[TILE_M][2];
-    __shared__ float Ad[TILE_N];
+    // plain aligned loads: word `kk*8 + h*4 + tig` is exactly the four codes a
+    // lane wants for half `h` of 32-window `kk`.
+    // Row strides of 16 and 4 words put every fragment lane of a `group` on
+    // one of eight banks - a four-way conflict on the hottest loads in the
+    // kernel - so each row carries one word of padding to spread the groups.
+    __shared__ int   As[TILE_M][17];
+    __shared__ int   Bs[TILE_N][17];
+    __shared__ float Ws[TILE_M][5];
+    __shared__ float Ad[TILE_N][2];
 
     const int lane  = threadIdx.x % GK_WARP_SIZE;
     const int warp  = threadIdx.x / GK_WARP_SIZE;
@@ -1099,118 +1105,164 @@ void gk_cu_k_mul_mat_mma_nvfp4(gk_tview a, gk_tview_mut d,
         }
     }
 
-    for (int64_t g = 0; g < n_grp; ++g) {
-        const int64_t kk0 = g * GK_CU_MMA_K;
+    // Which half of a 64-wide k-round this thread stages, of both its row and
+    // its column.
+    const int st_i = (int) threadIdx.x / 2;
+    const int st_h = (int) threadIdx.x % 2;
 
-        // Staging: TILE_M threads take a weight row each, the other TILE_N an
-        // activation column each - the whole block, at either width.
-        if (threadIdx.x < TILE_M) {
-            const int     r = (int) threadIdx.x;
-            const int64_t m = m0 + r;
+    // The weight stream, software-pipelined one round ahead: the raw words of
+    // round g+1 are requested while round g computes, so the DRAM latency of
+    // the larger operand is paid behind the mma work instead of on the
+    // critical path between the barriers. A 64-element block and its stride
+    // are both a whole number of words, so the five loads are plain word
+    // loads; they stay raw here and are decoded only at the store into
+    // shared. The activation side is not worth pipelining: it is the smaller
+    // stream by 4x to 8x and mostly lands in L2 - measured, a cp.async
+    // double buffer for it cost 5% rather than paying, between the extra
+    // shared memory and a barrier that no longer covered the weight decode.
+    const int64_t n_rnd = n_grp / 2;
 
-            if (m < n_rows) {
-                // one 64-element nvfp4 block holds four sub-scales; this
-                // k-step covers two of them
-                const uint8_t * blk =
-                    (const uint8_t *) gk_cu_row(a, m, a2, a3) + (kk0 / 64) * 36;
-                const int sub0 = (int) ((kk0 % 64) / 16);
+    const uint8_t * a_row  = NULL;
+    int             a_pw[4];
+    int             a_sc   = 0;
 
+    {
+        const int64_t m = m0 + st_i;
+        if (m < n_rows) {
+            a_row = (const uint8_t *) gk_cu_row(a, m, a2, a3);
+        }
+    }
+
+#define GK_CU_NVFP4_FETCH(gg)                                                  \
+    do {                                                                       \
+        if (a_row != NULL && (gg) < n_rnd) {                                   \
+            const uint8_t * blk = a_row + (gg) * 36;                           \
+            const int *     w   = (const int *) (blk + 4) + st_h * 4;          \
+            a_sc    = *(const int *) blk;                                      \
+            a_pw[0] = w[0];                                                    \
+            a_pw[1] = w[1];                                                    \
+            a_pw[2] = w[2];                                                    \
+            a_pw[3] = w[3];                                                    \
+        }                                                                      \
+    } while (0)
+
+    GK_CU_NVFP4_FETCH(0);
+
+    for (int64_t g = 0; g < n_rnd; ++g) {
+        {
+            const int r    = st_i;
+            const int sub0 = st_h * 2;
+
+            if (a_row != NULL) {
 #pragma unroll
                 for (int h = 0; h < 2; ++h) {
-                    const uint8_t * qs = blk + 4 + (sub0 + h) * 8;
+                    const int w0 = a_pw[h * 2 + 0]; // sub-block elements 0..3, 8..11
+                    const int w1 = a_pw[h * 2 + 1]; // and 4..7, 12..15
 
-                    const int w0 = gk_cu_int_b2(qs, 0); // sub-block elements 0..3, 8..11
-                    const int w1 = gk_cu_int_b2(qs, 1); // and 4..7, 12..15
+                    As[r][st_h * 8 + h * 4 + 0] = gk_cu_e2m1_quad(w0, 0);
+                    As[r][st_h * 8 + h * 4 + 1] = gk_cu_e2m1_quad(w1, 0);
+                    As[r][st_h * 8 + h * 4 + 2] = gk_cu_e2m1_quad(w0, 4);
+                    As[r][st_h * 8 + h * 4 + 3] = gk_cu_e2m1_quad(w1, 4);
 
-                    As[r][h * 4 + 0] = gk_cu_e2m1_quad(w0, 0);
-                    As[r][h * 4 + 1] = gk_cu_e2m1_quad(w1, 0);
-                    As[r][h * 4 + 2] = gk_cu_e2m1_quad(w0, 4);
-                    As[r][h * 4 + 3] = gk_cu_e2m1_quad(w1, 4);
-
-                    Ws[r][h] = gk_cu_ue4m3(blk[sub0 + h]);
+                    Ws[r][sub0 + h] = gk_cu_ue4m3((uint8_t) (a_sc >> (8 * (sub0 + h))));
                 }
             } else {
 #pragma unroll
                 for (int i = 0; i < 8; ++i) {
-                    As[r][i] = 0;
+                    As[r][st_h * 8 + i] = 0;
                 }
-                Ws[r][0] = 0.0f;
-                Ws[r][1] = 0.0f;
+                Ws[r][st_h * 2 + 0] = 0.0f;
+                Ws[r][st_h * 2 + 1] = 0.0f;
             }
-        } else if (threadIdx.x < TILE_M + TILE_N) {
-            const int     c = (int) threadIdx.x - TILE_M;
+        }
+
+        {
+            const int     c = st_i;
             const int64_t n = n0 + c;
 
             if (n < n_cols) {
-                const gk_cu_q8blk & ab = aq23[n * n_grp + g];
+                const gk_cu_q8blk & ab = aq23[n * n_grp + g * 2 + st_h];
 #pragma unroll
                 for (int i = 0; i < 8; ++i) {
-                    Bs[c][i] = ab.q[i];
+                    Bs[c][st_h * 8 + i] = ab.q[i];
                 }
-                Ad[c] = ab.d;
+                Ad[c][st_h] = ab.d;
             } else {
 #pragma unroll
                 for (int i = 0; i < 8; ++i) {
-                    Bs[c][i] = 0;
+                    Bs[c][st_h * 8 + i] = 0;
                 }
-                Ad[c] = 0.0f;
+                Ad[c][st_h] = 0.0f;
             }
         }
 
         __syncthreads();
 
-        // The activation scale belongs to the whole 32-element block, so it is
-        // the same for both mma windows below - read once per k-step rather
-        // than once per window, which is eight of the shared loads this loop
-        // used to make per window.
-        float adv[WNT][2];
-#pragma unroll
-        for (int ct = 0; ct < WNT; ++ct) {
-            const int c = warp_n * WN + ct * 8 + tig * 2;
-            adv[ct][0] = Ad[c + 0];
-            adv[ct][1] = Ad[c + 1];
-        }
+        GK_CU_NVFP4_FETCH(g + 1);
 
-        // Two mma windows, one per sub-scale. The accumulator is drained to
-        // float between them because the scale it would be multiplied by
-        // changes - which is the whole cost of this format on tensor cores.
+        // Two 32-wide windows per staged round, each two mma sub-windows -
+        // one per sub-scale - drained together. The accumulator has to leave
+        // s32 whenever the scale changes - the whole cost of this format on
+        // tensor cores - but the two sub-windows' drains share every factor
+        // except the sub-scale, so paying for them in one expression is five
+        // float instructions per element instead of eight:
+        //   acc += adv * (ws0*df0 + ws1*df1)
 #pragma unroll
-        for (int h = 0; h < 2; ++h) {
-            int   af[GK_CU_MMA_WMT][2];
-            float ws[GK_CU_MMA_WMT][2];
+        for (int kk = 0; kk < 2; ++kk) {
+            // The activation scale belongs to the whole 32-element block, so
+            // it is the same for both mma sub-windows - read once per window
+            // rather than once per sub-window.
+            float adv[WNT][2];
+#pragma unroll
+            for (int ct = 0; ct < WNT; ++ct) {
+                const int c = warp_n * WN + ct * 8 + tig * 2;
+                adv[ct][0] = Ad[c + 0][kk];
+                adv[ct][1] = Ad[c + 1][kk];
+            }
+
+            int   af[2][GK_CU_MMA_WMT][2];
+            float ws[2][GK_CU_MMA_WMT][2];
 
 #pragma unroll
-            for (int wt = 0; wt < GK_CU_MMA_WMT; ++wt) {
-                const int r_lo = warp_m * GK_CU_MMA_WM + wt * 16 + group;
+            for (int h = 0; h < 2; ++h) {
+#pragma unroll
+                for (int wt = 0; wt < GK_CU_MMA_WMT; ++wt) {
+                    const int r_lo = warp_m * GK_CU_MMA_WM + wt * 16 + group;
 
-                af[wt][0] = As[r_lo    ][h * 4 + tig];
-                af[wt][1] = As[r_lo + 8][h * 4 + tig];
-                ws[wt][0] = Ws[r_lo    ][h];
-                ws[wt][1] = Ws[r_lo + 8][h];
+                    af[h][wt][0] = As[r_lo    ][kk * 8 + h * 4 + tig];
+                    af[h][wt][1] = As[r_lo + 8][kk * 8 + h * 4 + tig];
+                    ws[h][wt][0] = Ws[r_lo    ][kk * 2 + h];
+                    ws[h][wt][1] = Ws[r_lo + 8][kk * 2 + h];
+                }
             }
 
 #pragma unroll
             for (int ct = 0; ct < WNT; ++ct) {
-                // One B fragment, both row tiles - which is what giving a warp
-                // two of them buys.
-                const int bf = Bs[warp_n * WN + ct * 8 + group][h * 4 + tig];
+                // One B fragment per sub-window, both row tiles - which is
+                // what giving a warp two of them buys.
+                const int bf0 = Bs[warp_n * WN + ct * 8 + group][kk * 8 +     tig];
+                const int bf1 = Bs[warp_n * WN + ct * 8 + group][kk * 8 + 4 + tig];
 
 #pragma unroll
                 for (int wt = 0; wt < GK_CU_MMA_WMT; ++wt) {
-                    int df[4] = { 0, 0, 0, 0 };
+                    int df0[4] = { 0, 0, 0, 0 };
+                    int df1[4] = { 0, 0, 0, 0 };
 
-                    gk_cu_mma_s8(df, af[wt], bf);
+                    gk_cu_mma_s8(df0, af[0][wt], bf0);
+                    gk_cu_mma_s8(df1, af[1][wt], bf1);
 
-                    acc[wt][ct][0] += ws[wt][0] * adv[ct][0] * (float) df[0];
-                    acc[wt][ct][1] += ws[wt][0] * adv[ct][1] * (float) df[1];
-                    acc[wt][ct][2] += ws[wt][1] * adv[ct][0] * (float) df[2];
-                    acc[wt][ct][3] += ws[wt][1] * adv[ct][1] * (float) df[3];
+                    acc[wt][ct][0] += adv[ct][0] * (ws[0][wt][0] * (float) df0[0] + ws[1][wt][0] * (float) df1[0]);
+                    acc[wt][ct][1] += adv[ct][1] * (ws[0][wt][0] * (float) df0[1] + ws[1][wt][0] * (float) df1[1]);
+                    acc[wt][ct][2] += adv[ct][0] * (ws[0][wt][1] * (float) df0[2] + ws[1][wt][1] * (float) df1[2]);
+                    acc[wt][ct][3] += adv[ct][1] * (ws[0][wt][1] * (float) df0[3] + ws[1][wt][1] * (float) df1[3]);
                 }
             }
         }
 
         __syncthreads();
     }
+
+#undef GK_CU_NVFP4_FETCH
 
 #pragma unroll
     for (int wt = 0; wt < GK_CU_MMA_WMT; ++wt) {

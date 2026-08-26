@@ -450,6 +450,26 @@ DIT_MM(proj,  3072,  3072)   // attention qkv / out projection - 48 per step
 DIT_MM(ffup,  3072, 12288)   // feed-forward in  - 12 per step
 DIT_MM(ffdn, 12288,  3072)   // feed-forward out - 12 per step
 
+// The four matmuls a Z-Image DiT step is made of, read off a profile of an
+// actual 8-step generation: 1056 tokens, hidden 3840, feed-forward opening to
+// 10240 (up and gate fused), and a fused qkv of 11520 rows. Together they are
+// 64% of the run's device time at nvfp4. Same three ways as above.
+#define ZIMG_MM(name, k, rows)                                                           \
+    static struct gk_tensor * b_zi_##name##_nv (struct gk_ctx * c) {                     \
+        return mul_mat_case(c, GK_TYPE_NVFP4, (k), (rows), 1056);                        \
+    }                                                                                    \
+    static struct gk_tensor * b_zi_##name##_f16(struct gk_ctx * c) {                     \
+        return mul_mat_case(c, GK_TYPE_F16,   (k), (rows), 1056);                        \
+    }                                                                                    \
+    static struct gk_tensor * b_zi_##name##_q4k(struct gk_ctx * c) {                     \
+        return mul_mat_case(c, GK_TYPE_Q4_K,  (k), (rows), 1056);                        \
+    }
+
+ZIMG_MM(qkv,   3840, 11520)
+ZIMG_MM(proj,  3840,  3840)
+ZIMG_MM(ffup,  3840, 10240)
+ZIMG_MM(ffdn, 10240,  3840)
+
 // The four matmuls a MiniMax-H3 video DiT step is made of, read off a profile
 // of an actual 480x480x124 generation: 8742 tokens, hidden 5376, feed-forward
 // to 14336, and a fused qkv of 28672 rows. Between them they are 59% of a
@@ -575,6 +595,9 @@ static struct gk_tensor * b_fa_dit_4k_d128(struct gk_ctx * c) { return fattn_squ
 // cost is dominated by how many times a block re-reads the cache, which is a
 // function of exactly the token count the small cases shrink.
 static struct gk_tensor * b_fa_h3(struct gk_ctx * c) { return fattn_square_d(c, 8742, 56, 128); }
+
+// Z-Image's self-attention: 1056 tokens, 30 heads of 128.
+static struct gk_tensor * b_fa_zimg(struct gk_ctx * c) { return fattn_square_d(c, 1056, 30, 128); }
 
 static struct gk_tensor * b_fa_dit_1k(struct gk_ctx * c) { return fattn_square(c, 1024, 16); }
 static struct gk_tensor * b_fa_dit_2k(struct gk_ctx * c) { return fattn_square(c, 2048, 16); }
@@ -1015,6 +1038,20 @@ static const struct bench_case g_cases[] = {
     { NULL,            "ff out    f16",   "7168x5376 n=8742",   b_h3_ffo_f16,  ARENA_HUGE },
     { NULL,            "ff out    q4_K",  "7168x5376 n=8742",   b_h3_ffo_q4k,  ARENA_HUGE },
 
+    { "Z-Image DiT matmuls (nvfp4, against f16 and q4_K at the same shape)",
+                       "qkv       nvfp4", "3840x11520 n=1056",  b_zi_qkv_nv,   ARENA_BIG },
+    { NULL,            "qkv       f16",   "3840x11520 n=1056",  b_zi_qkv_f16,  ARENA_BIG },
+    { NULL,            "qkv       q4_K",  "3840x11520 n=1056",  b_zi_qkv_q4k,  ARENA_BIG },
+    { NULL,            "proj      nvfp4", "3840x3840 n=1056",   b_zi_proj_nv,  ARENA_BIG },
+    { NULL,            "proj      f16",   "3840x3840 n=1056",   b_zi_proj_f16, ARENA_BIG },
+    { NULL,            "proj      q4_K",  "3840x3840 n=1056",   b_zi_proj_q4k, ARENA_BIG },
+    { NULL,            "ff up     nvfp4", "3840x10240 n=1056",  b_zi_ffup_nv,  ARENA_BIG },
+    { NULL,            "ff up     f16",   "3840x10240 n=1056",  b_zi_ffup_f16, ARENA_BIG },
+    { NULL,            "ff up     q4_K",  "3840x10240 n=1056",  b_zi_ffup_q4k, ARENA_BIG },
+    { NULL,            "ff down   nvfp4", "10240x3840 n=1056",  b_zi_ffdn_nv,  ARENA_BIG },
+    { NULL,            "ff down   f16",   "10240x3840 n=1056",  b_zi_ffdn_f16, ARENA_BIG },
+    { NULL,            "ff down   q4_K",  "10240x3840 n=1056",  b_zi_ffdn_q4k, ARENA_BIG },
+
     { "MiniMax-H3 video VAE decoder matmuls (36 layers x 28 tiles a decode)",
                        "ff up     f16",   "2048x16384 n=1797",  b_vae_ffup,    ARENA_BIG  },
     { NULL,            "ff down   f16",   "8192x2048 n=1797",   b_vae_ffdn,    ARENA_BIG  },
@@ -1040,6 +1077,7 @@ static const struct bench_case g_cases[] = {
     { NULL,        "flash_attn DiT d128","2048 tok x16",   b_fa_dit_2k_d128, ARENA_BIG },
     { NULL,        "flash_attn DiT d128","4096 tok x16",   b_fa_dit_4k_d128, ARENA_BIG },
     { NULL,        "flash_attn H3 d128", "8742 tok x56",   b_fa_h3,          ARENA_HUGE },
+    { NULL,        "flash_attn ZImg d128","1056 tok x30",  b_fa_zimg,        ARENA_BIG  },
     { NULL,        "soft_max decode",    "2048x1x8",       b_softmax_dec, ARENA_SMALL },
     { NULL,        "soft_max prefill",   "512x512x8",      b_softmax_pre, ARENA_MID   },
 
