@@ -80,6 +80,20 @@ void gk_cuda_fused_rms_mul(gkStream_t stream, const struct gk_tensor * norm,
 
 // The three-op residual chain (add, rms_norm, mul): one kernel writing both
 // the add's and the mul's destinations.
+// The tail fusions: same contracts as the pair above, but the parts need not
+// be adjacent - the plan proved the gap safe. All are bit-exact against the
+// chains they replace.
+void gk_cuda_fused_rms_mul_x(gkStream_t stream, const struct gk_tensor * norm,
+                             const struct gk_tensor * mul);
+void gk_cuda_fused_add_rms_mul_x(gkStream_t stream, const struct gk_tensor * add,
+                                 const struct gk_tensor * norm, const struct gk_tensor * mul);
+void gk_cuda_fused_madd(gkStream_t stream, const struct gk_tensor * mul,
+                        const struct gk_tensor * add, const struct gk_tensor * add2);
+void gk_cuda_fused_unary_mul(gkStream_t stream, const struct gk_tensor * un,
+                             const struct gk_tensor * mul);
+void gk_cuda_fused_rope_pair(gkStream_t stream, const struct gk_tensor * m1,
+                             const struct gk_tensor * m2, const struct gk_tensor * add);
+
 void gk_cuda_fused_add_rms_mul(gkStream_t stream, const struct gk_tensor * add,
                                const struct gk_tensor * norm, const struct gk_tensor * mul);
 void gk_cuda_flash_attn(gkStream_t stream, struct gk_cuda_scratch * scratch,

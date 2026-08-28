@@ -3224,7 +3224,9 @@ void gk_cu_k_mul_mat_mma_q2k_pipe(gk_tview a, gk_tview_mut d,
     __shared__ uint32_t Ahd[2][GK_CU_MMAQ_TILE_M];          // s0,s1 of group g, then of g+1
     __shared__ uint32_t Add[2][GK_CU_MMAQ_TILE_M];          // d, dmin as raw halves
     __shared__ int      Bs [2][2][GK_CU_MMAQ_TILE_N][9];    // [buf][sg][col][word + pad]
-    __shared__ float    Apl[2][2][3][GK_CU_MMAQ_TILE_N];    // d, d*s, d*sl planes
+    // 16-aligned so a lane's even-indexed pair of column constants is one
+    // 64-bit load - three loads per column tile instead of six.
+    __shared__ __align__(16) float Apl[2][2][3][GK_CU_MMAQ_TILE_N]; // d, d*s, d*sl planes
 
     const int lane  = threadIdx.x % GK_WARP_SIZE;
     const int warp  = threadIdx.x / GK_WARP_SIZE;
@@ -3492,13 +3494,14 @@ void gk_cu_k_mul_mat_mma_q2k_pipe(gk_tview a, gk_tview_mut d,
 
                 const int cd = warp_n * GK_CU_MMAQ_WN + ct * 8 + tig * 2;
 
-                float adv[2], alv[2], ahv[2];
-                adv[0] = Apl[buf][gg][0][cd + 0];
-                adv[1] = Apl[buf][gg][0][cd + 1];
-                alv[0] = Apl[buf][gg][2][cd + 0];
-                alv[1] = Apl[buf][gg][2][cd + 1];
-                ahv[0] = Apl[buf][gg][1][cd + 0] - alv[0];
-                ahv[1] = Apl[buf][gg][1][cd + 1] - alv[1];
+                // cd is even, so each pair is one aligned 64-bit load
+                const float2 advv = *(const float2 *) &Apl[buf][gg][0][cd];
+                const float2 adsv = *(const float2 *) &Apl[buf][gg][1][cd];
+                const float2 alvv = *(const float2 *) &Apl[buf][gg][2][cd];
+
+                const float adv[2] = { advv.x, advv.y };
+                const float alv[2] = { alvv.x, alvv.y };
+                const float ahv[2] = { adsv.x - alvv.x, adsv.y - alvv.y };
 
 #pragma unroll
                 for (int wt = 0; wt < GK_CU_MMAQ_WMT; ++wt) {

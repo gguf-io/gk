@@ -748,6 +748,19 @@ static inline enum gk_status gk_cuda_launch_one(struct gk_cuda_backend_ctx * ctx
 #define GK_CU_FUSE_SKIP  2 // covered by an earlier node's fused launch
 #define GK_CU_FUSE_HEAD3 3 // fused (add, rms_norm, mul): covers three nodes
 
+// The tail fusions: the head is the *last* node of its chain and the parts
+// sit anywhere behind it, marked SKIP where they stand. This is the shape a
+// DiT block takes - its norms are separated from their muls by the nodes
+// that build the weight, its gates and rope are spelled out in elementwise
+// steps - so the adjacent pairs above never fire there. `aux` carries the
+// part indices the head's launcher needs.
+#define GK_CU_FUSE_RMSMUL_T    4 // at the mul: (rms_norm ... mul)
+#define GK_CU_FUSE_ADDRMSMUL_T 5 // at the mul: (add, rms_norm ... mul)
+#define GK_CU_FUSE_MADD        6 // at the add: c + y*g, g one row
+#define GK_CU_FUSE_MADDS       7 // at the second add: c + y*g + t
+#define GK_CU_FUSE_UNARYMUL    8 // at the mul: unary(x) * y
+#define GK_CU_FUSE_ROPE2       9 // at the add: x1*f1 + x2*f2, repeats elided
+
 static bool gk_cu_fuse_on(void) {
     static int on = -1;
     if (on < 0) {
@@ -772,8 +785,46 @@ static bool gk_cu_fuse_weight(const struct gk_tensor * w, int64_t ne0) {
            w->ne[1] == 1 && w->ne[2] == 1 && w->ne[3] == 1;
 }
 
-static void gk_cu_fuse_plan(struct gk_cgraph * graph, int n, std::vector<uint8_t> & tag) {
+// Whether the tail fusions run; `GK_CUDA_FUSE_TAIL=0` takes only them out
+// of a bisect while the adjacent pairs stay.
+static bool gk_cu_fuse_tail_on(void) {
+    static int on = -1;
+    if (on < 0) {
+        const char * e = getenv("GK_CUDA_FUSE_TAIL");
+        on = !(e != NULL && e[0] == '0');
+    }
+    return on != 0;
+}
+
+// Whether this node's launch writes its output at all: the view family does
+// not, and treating a view as a writer would veto every window it sits in.
+static bool gk_cu_fuse_writes(const struct gk_tensor * t) {
+    switch (t->op) {
+        case GK_OP_NONE: case GK_OP_RESHAPE: case GK_OP_VIEW:
+        case GK_OP_PERMUTE: case GK_OP_TRANSPOSE:
+            return false;
+        default:
+            return true;
+    }
+}
+
+static bool gk_cu_fuse_overlap(const struct gk_tensor * a, const struct gk_tensor * b) {
+    const uint8_t * al = (const uint8_t *) a->data;
+    const uint8_t * ah = al + gk_nbytes(a);
+    const uint8_t * bl = (const uint8_t *) b->data;
+    const uint8_t * bh = bl + gk_nbytes(b);
+    return al < bh && bl < ah;
+}
+
+static bool gk_cu_fuse_same_ne(const struct gk_tensor * a, const struct gk_tensor * b) {
+    return a->ne[0] == b->ne[0] && a->ne[1] == b->ne[1] &&
+           a->ne[2] == b->ne[2] && a->ne[3] == b->ne[3];
+}
+
+static void gk_cu_fuse_plan(struct gk_cgraph * graph, int n, std::vector<uint8_t> & tag,
+                            std::vector<int32_t> & aux) {
     tag.assign((size_t) n, GK_CU_FUSE_NONE);
+    aux.assign((size_t) n * 2, -1);
 
     if (!gk_cu_fuse_on()) {
         return;
@@ -854,25 +905,364 @@ static void gk_cu_fuse_plan(struct gk_cgraph * graph, int n, std::vector<uint8_t
         tag[(size_t) i + 1] = GK_CU_FUSE_SKIP;
         ++i; // the pair is settled; the tail cannot head another pair
     }
+
+    if (!gk_cu_fuse_tail_on()) {
+        return;
+    }
+
+    // ----- the tail fusions -----
+
+    std::unordered_map<const struct gk_tensor *, int> pos;
+    pos.reserve((size_t) n * 2);
+    for (int i = 0; i < n; ++i) {
+        pos[gk_graph_node(graph, i)] = i;
+    }
+
+    // The fusion plan runs after allocation, and that is what makes a
+    // non-adjacent chain checkable at all: a part's input dies - to the
+    // allocator - at the part, so a node between the part and the head may
+    // have been given that very storage for its own output. The check is by
+    // actual pointer ranges: no writer in the window may overlap a tensor
+    // the fused launch still reads (its own producer excepted - that write
+    // is the dependency), and no node in the window may read an output the
+    // fused launch defers to the head.
+    auto window_ok = [&](int from, int to,
+                         std::initializer_list<const struct gk_tensor *> reads,
+                         std::initializer_list<const struct gk_tensor *> late,
+                         std::initializer_list<int> parts) -> bool {
+        if (to - from > 24) {
+            return false;
+        }
+        for (int j = from + 1; j < to; ++j) {
+            bool is_part = false;
+            for (int p : parts) {
+                if (p == j) { is_part = true; break; }
+            }
+            if (is_part) {
+                continue;
+            }
+
+            const struct gk_tensor * nj = gk_graph_node(graph, j);
+            if (gk_cu_fuse_writes(nj)) {
+                for (const struct gk_tensor * r : reads) {
+                    // a read that is the writer itself, or a view into it,
+                    // is the dependency this window exists to preserve -
+                    // rope's frequency views live inside the cont that
+                    // produces them
+                    if (r == NULL || nj == r ||
+                        (r->view_src != NULL && r->view_src == nj)) {
+                        continue;
+                    }
+                    if (gk_cu_fuse_overlap(nj, r)) {
+                        return false;
+                    }
+                }
+            }
+            for (int s = 0; s < GK_MAX_SRC && nj->src[s] != NULL; ++s) {
+                for (const struct gk_tensor * l : late) {
+                    if (nj->src[s] == l) {
+                        return false;
+                    }
+                }
+            }
+        }
+        return true;
+    };
+
+    auto clean = [&](const struct gk_tensor * t, int * idx) -> bool {
+        auto it = pos.find(t);
+        if (it == pos.end() || tag[(size_t) it->second] != GK_CU_FUSE_NONE) {
+            return false;
+        }
+        *idx = it->second;
+        return (t->flags & (GK_TENSOR_FLAG_OUTPUT | GK_TENSOR_FLAG_INPUT)) == 0;
+    };
+
+    for (int i = 0; i < n; ++i) {
+        if (tag[(size_t) i] != GK_CU_FUSE_NONE) {
+            continue;
+        }
+        struct gk_tensor * h = gk_graph_node(graph, i);
+
+        if (h->op == GK_OP_MUL && h->src[0] != NULL && h->src[1] != NULL) {
+            // (rms_norm [after an add] ... mul-by-weight), the parts behind:
+            // a DiT builds the weight *between* the norm and the mul.
+            struct gk_tensor * nm =
+                h->src[0]->op == GK_OP_RMS_NORM ? h->src[0] :
+                h->src[1]->op == GK_OP_RMS_NORM ? h->src[1] : NULL;
+
+            int ni = -1;
+            if (nm != NULL && clean(nm, &ni) && uses[nm] == 1 &&
+                (int) nm->type == GK_TYPE_F32 && gk_cu_fuse_same_ne(h, nm) &&
+                gk_cu_fuse_flat(h) && gk_cu_fuse_flat(nm->src[0]) &&
+                gk_cu_fuse_weight(h->src[0] == nm ? h->src[1] : h->src[0], h->ne[0])) {
+                const struct gk_tensor * w = h->src[0] == nm ? h->src[1] : h->src[0];
+
+                // the residual add feeding the norm comes along when it is
+                // untouched in between - its output is still written
+                struct gk_tensor * ad = nm->src[0];
+                int ai = -1;
+                bool done = false;
+                if (ad->op == GK_OP_ADD && ad->src[0] != NULL && ad->src[1] != NULL) {
+                    auto ait = pos.find(ad);
+                    if (ait != pos.end() && tag[(size_t) ait->second] == GK_CU_FUSE_NONE &&
+                        (ad->flags & GK_TENSOR_FLAG_INPUT) == 0) {
+                        ai = ait->second;
+                        const bool ew =
+                            gk_cu_fuse_same_ne(ad, ad->src[0]) &&
+                            gk_cu_fuse_same_ne(ad, ad->src[1]) &&
+                            gk_cu_fuse_same_ne(ad, h);
+                        if (ew && gk_cu_fuse_flat(ad) &&
+                            gk_cu_fuse_flat(ad->src[0]) && gk_cu_fuse_flat(ad->src[1]) &&
+                            window_ok(ai, i, { ad->src[0], ad->src[1], w },
+                                      { ad, nm }, { ni })) {
+                            tag[(size_t) ai] = GK_CU_FUSE_SKIP;
+                            tag[(size_t) ni] = GK_CU_FUSE_SKIP;
+                            tag[(size_t) i]  = GK_CU_FUSE_ADDRMSMUL_T;
+                            aux[(size_t) i * 2]     = ni;
+                            aux[(size_t) i * 2 + 1] = ai;
+                            done = true;
+                        }
+                    }
+                }
+                if (!done && window_ok(ni, i, { nm->src[0], w }, { nm }, {})) {
+                    tag[(size_t) ni] = GK_CU_FUSE_SKIP;
+                    tag[(size_t) i]  = GK_CU_FUSE_RMSMUL_T;
+                    aux[(size_t) i * 2] = ni;
+                }
+                continue;
+            }
+
+            // unary(x) * y - the attention gate, and the MLP's geglu when
+            // the allocator left the gate projection readable
+            struct gk_tensor * u =
+                h->src[0]->op == GK_OP_UNARY ? h->src[0] :
+                h->src[1]->op == GK_OP_UNARY ? h->src[1] : NULL;
+
+            int ui = -1;
+            if (u != NULL && clean(u, &ui) && uses[u] == 1 &&
+                (int) u->type == GK_TYPE_F32 && gk_cu_fuse_same_ne(h, u) &&
+                gk_cu_fuse_same_ne(h, h->src[0] == u ? h->src[1] : h->src[0]) &&
+                gk_cu_fuse_flat(h) && gk_cu_fuse_flat(u->src[0]) &&
+                gk_cu_fuse_flat(h->src[0] == u ? h->src[1] : h->src[0])) {
+                const struct gk_tensor * y = h->src[0] == u ? h->src[1] : h->src[0];
+                if (window_ok(ui, i, { u->src[0], y }, { u }, {})) {
+                    tag[(size_t) ui] = GK_CU_FUSE_SKIP;
+                    tag[(size_t) i]  = GK_CU_FUSE_UNARYMUL;
+                    aux[(size_t) i * 2] = ui;
+                }
+                continue;
+            }
+        }
+
+        if (h->op == GK_OP_ADD && h->src[0] != NULL && h->src[1] != NULL) {
+            // The hand-built rope pair: add(mul(repeat(x1), f1),
+            // mul(repeat(x2), f2)), where each x is [1,K,T,H], each f
+            // [2,K,T,1], the output [2,K,T,H]. The repeats materialize x at
+            // full width twice; collapsed, x is read once.
+            struct gk_tensor * m1 = h->src[0];
+            struct gk_tensor * m2 = h->src[1];
+            if (m1 != m2 && m1->op == GK_OP_MUL && m2->op == GK_OP_MUL &&
+                h->ne[0] == 2 && (int) h->type == GK_TYPE_F32 && gk_is_contiguous(h) &&
+                ((uintptr_t) h->data & 7u) == 0) {
+                int mi[2] = { -1, -1 };
+                int ri[2] = { -1, -1 };
+                bool ok = true;
+                for (int k = 0; k < 2 && ok; ++k) {
+                    struct gk_tensor * m = k == 0 ? m1 : m2;
+                    ok = clean(m, &mi[k]) && uses[m] == 1 && gk_cu_fuse_same_ne(m, h);
+                    if (!ok) { break; }
+
+                    struct gk_tensor * r =
+                        m->src[0] != NULL && m->src[0]->op == GK_OP_REPEAT ? m->src[0] :
+                        m->src[1] != NULL && m->src[1]->op == GK_OP_REPEAT ? m->src[1] : NULL;
+                    const struct gk_tensor * f = r == m->src[0] ? m->src[1] : m->src[0];
+
+                    ok = r != NULL && f != NULL && clean(r, &ri[k]) && uses[r] == 1 &&
+                         gk_cu_fuse_same_ne(r, h) &&
+                         (int) r->src[0]->type == GK_TYPE_F32 &&
+                         gk_is_contiguous(r->src[0]) &&
+                         r->src[0]->ne[0] == 1 && r->src[0]->ne[1] == h->ne[1] &&
+                         r->src[0]->ne[2] == h->ne[2] && r->src[0]->ne[3] == h->ne[3] &&
+                         (int) f->type == GK_TYPE_F32 && gk_is_contiguous(f) &&
+                         f->ne[0] == 2 && f->ne[1] == h->ne[1] &&
+                         f->ne[2] == h->ne[2] && f->ne[3] == 1 &&
+                         ((uintptr_t) f->data & 7u) == 0;
+                }
+                if (ok) {
+                    const struct gk_tensor * f1 = m1->src[0]->op == GK_OP_REPEAT
+                                                ? m1->src[1] : m1->src[0];
+                    const struct gk_tensor * f2 = m2->src[0]->op == GK_OP_REPEAT
+                                                ? m2->src[1] : m2->src[0];
+                    const struct gk_tensor * r1 = m1->src[0]->op == GK_OP_REPEAT
+                                                ? m1->src[0] : m1->src[1];
+                    const struct gk_tensor * r2 = m2->src[0]->op == GK_OP_REPEAT
+                                                ? m2->src[0] : m2->src[1];
+                    const int from = ri[0] < ri[1] ? ri[0] : ri[1];
+                    if (window_ok(from, i, { r1->src[0], r2->src[0], f1, f2 }, {},
+                                  { ri[0], ri[1], mi[0], mi[1] })) {
+                        tag[(size_t) ri[0]] = GK_CU_FUSE_SKIP;
+                        tag[(size_t) ri[1]] = GK_CU_FUSE_SKIP;
+                        tag[(size_t) mi[0]] = GK_CU_FUSE_SKIP;
+                        tag[(size_t) mi[1]] = GK_CU_FUSE_SKIP;
+                        tag[(size_t) i]     = GK_CU_FUSE_ROPE2;
+                        continue;
+                    }
+                }
+            }
+
+            // c + y*g (+ t): the gate and modulate cluster, g and t one
+            // broadcast row each
+            for (int side = 0; side < 2; ++side) {
+                struct gk_tensor * m = h->src[side];
+                struct gk_tensor * c = h->src[side ^ 1];
+                if (m->op != GK_OP_MUL || m->src[0] == NULL || m->src[1] == NULL) {
+                    continue;
+                }
+
+                int mi2 = -1;
+                if (!(clean(m, &mi2) && uses[m] == 1 && gk_cu_fuse_same_ne(m, h))) {
+                    continue;
+                }
+
+                const bool g0 = gk_cu_fuse_weight(m->src[0], h->ne[0]) &&
+                                gk_cu_fuse_same_ne(m->src[1], h);
+                const bool g1 = gk_cu_fuse_weight(m->src[1], h->ne[0]) &&
+                                gk_cu_fuse_same_ne(m->src[0], h);
+                if (g0 == g1) {   // none, or ambiguous
+                    continue;
+                }
+                const struct gk_tensor * g = g0 ? m->src[0] : m->src[1];
+                const struct gk_tensor * y = g0 ? m->src[1] : m->src[0];
+
+                if (!(gk_cu_fuse_flat(h) && gk_cu_fuse_flat(y) &&
+                      gk_cu_fuse_flat(c) && gk_cu_fuse_same_ne(c, h))) {
+                    continue;
+                }
+
+                // a trailing broadcast shift extends the pair to
+                // x*(1+s)+t in one pass - the modulate spelling
+                if (uses[h] == 1 &&
+                    (h->flags & (GK_TENSOR_FLAG_OUTPUT | GK_TENSOR_FLAG_INPUT)) == 0) {
+                    for (int j = i + 1; j < n && j <= i + 8; ++j) {
+                        struct gk_tensor * h2 = gk_graph_node(graph, j);
+                        if (h2->src[0] != h && h2->src[1] != h) {
+                            continue;
+                        }
+                        if (h2->op != GK_OP_ADD ||
+                            tag[(size_t) j] != GK_CU_FUSE_NONE ||
+                            !gk_cu_fuse_same_ne(h2, h) || !gk_cu_fuse_flat(h2)) {
+                            break;
+                        }
+                        const struct gk_tensor * t = h2->src[0] == h ? h2->src[1]
+                                                                     : h2->src[0];
+                        if (!gk_cu_fuse_weight(t, h->ne[0])) {
+                            break;
+                        }
+                        if (window_ok(mi2, j, { c, y, g, t }, { h }, { i })) {
+                            tag[(size_t) mi2] = GK_CU_FUSE_SKIP;
+                            tag[(size_t) i]   = GK_CU_FUSE_SKIP;
+                            tag[(size_t) j]   = GK_CU_FUSE_MADDS;
+                            aux[(size_t) j * 2]     = mi2;
+                            aux[(size_t) j * 2 + 1] = i;
+                        }
+                        break;
+                    }
+                    if (tag[(size_t) i] != GK_CU_FUSE_NONE) {
+                        break;
+                    }
+                }
+
+                if (window_ok(mi2, i, { c, y, g }, {}, {})) {
+                    tag[(size_t) mi2] = GK_CU_FUSE_SKIP;
+                    tag[(size_t) i]   = GK_CU_FUSE_MADD;
+                    aux[(size_t) i * 2] = mi2;
+                }
+                break;
+            }
+        }
+    }
+
+    // GK_CUDA_FUSE_DUMP=1: what the plan decided, once per distinct node
+    // count - the fast way to see a pattern quietly not firing.
+    static int dump = -1;
+    if (dump < 0) {
+        const char * e = getenv("GK_CUDA_FUSE_DUMP");
+        dump = e != NULL && e[0] == '1' ? 1 : 0;
+    }
+    if (dump == 1) {
+        static std::unordered_map<int, bool> seen;
+        if (!seen[n]) {
+            seen[n] = true;
+            int cnt[10] = { 0 };
+            for (int i = 0; i < n; ++i) {
+                cnt[tag[(size_t) i]]++;
+            }
+            gk_logf("gk cuda fuse plan (%d nodes): head %d head3 %d rmsmul_t %d "
+                    "addrmsmul_t %d madd %d madds %d unarymul %d rope2 %d skip %d\n",
+                    n, cnt[GK_CU_FUSE_HEAD], cnt[GK_CU_FUSE_HEAD3],
+                    cnt[GK_CU_FUSE_RMSMUL_T], cnt[GK_CU_FUSE_ADDRMSMUL_T],
+                    cnt[GK_CU_FUSE_MADD], cnt[GK_CU_FUSE_MADDS],
+                    cnt[GK_CU_FUSE_UNARYMUL], cnt[GK_CU_FUSE_ROPE2],
+                    cnt[GK_CU_FUSE_SKIP]);
+        }
+    }
 }
 
 // The shared "launch node i under the plan" step: 0, 1 or 2 following nodes
-// are folded into this launch. Returns the number of nodes consumed, or 0 on
-// failure with the status in *st.
+// are folded into this launch, or the node is a tail head whose parts were
+// skipped where they stood, or the node itself is such a skipped part.
+// Returns the number of nodes consumed, or 0 on failure with the status in
+// *st.
 static inline int gk_cu_launch_planned(struct gk_cuda_backend_ctx * ctx,
                                        struct gk_cgraph * graph, int i,
-                                       uint8_t t, enum gk_status * st) {
+                                       uint8_t t, const std::vector<int32_t> & aux,
+                                       enum gk_status * st) {
     *st = GK_STATUS_SUCCESS;
 
-    if (t == GK_CU_FUSE_HEAD || t == GK_CU_FUSE_HEAD3) {
-        if (t == GK_CU_FUSE_HEAD) {
-            gk_cuda_fused_rms_mul(ctx->stream, gk_graph_node(graph, i),
-                                  gk_graph_node(graph, i + 1));
-        } else {
-            gk_cuda_fused_add_rms_mul(ctx->stream, gk_graph_node(graph, i),
-                                      gk_graph_node(graph, i + 1),
-                                      gk_graph_node(graph, i + 2));
+    if (t == GK_CU_FUSE_SKIP) {
+        // a part of a tail chain, launched at its head
+        return 1;
+    }
+
+    if (t != GK_CU_FUSE_NONE) {
+        struct gk_tensor * h  = gk_graph_node(graph, i);
+        const int32_t     a0 = aux[(size_t) i * 2];
+        const int32_t     a1 = aux[(size_t) i * 2 + 1];
+
+        switch (t) {
+            case GK_CU_FUSE_HEAD:
+                gk_cuda_fused_rms_mul(ctx->stream, h, gk_graph_node(graph, i + 1));
+                break;
+            case GK_CU_FUSE_HEAD3:
+                gk_cuda_fused_add_rms_mul(ctx->stream, h,
+                                          gk_graph_node(graph, i + 1),
+                                          gk_graph_node(graph, i + 2));
+                break;
+            case GK_CU_FUSE_RMSMUL_T:
+                gk_cuda_fused_rms_mul_x(ctx->stream, gk_graph_node(graph, a0), h);
+                break;
+            case GK_CU_FUSE_ADDRMSMUL_T:
+                gk_cuda_fused_add_rms_mul_x(ctx->stream, gk_graph_node(graph, a1),
+                                            gk_graph_node(graph, a0), h);
+                break;
+            case GK_CU_FUSE_MADD:
+                gk_cuda_fused_madd(ctx->stream, gk_graph_node(graph, a0), h, NULL);
+                break;
+            case GK_CU_FUSE_MADDS:
+                gk_cuda_fused_madd(ctx->stream, gk_graph_node(graph, a0),
+                                   gk_graph_node(graph, a1), h);
+                break;
+            case GK_CU_FUSE_UNARYMUL:
+                gk_cuda_fused_unary_mul(ctx->stream, gk_graph_node(graph, a0), h);
+                break;
+            case GK_CU_FUSE_ROPE2:
+                gk_cuda_fused_rope_pair(ctx->stream, h->src[0], h->src[1], h);
+                break;
+            default:
+                break;
         }
+
         const gkError_t err = gkGetLastError();
         if (err != gkSuccess) {
             gk_logf("gk %s: %s (fused chain at node %d)\n",
@@ -880,11 +1270,50 @@ static inline int gk_cu_launch_planned(struct gk_cuda_backend_ctx * ctx,
             *st = GK_STATUS_NO_STORAGE;
             return 0;
         }
-        return t == GK_CU_FUSE_HEAD ? 2 : 3;
+        return t == GK_CU_FUSE_HEAD ? 2 : t == GK_CU_FUSE_HEAD3 ? 3 : 1;
     }
 
     *st = gk_cuda_launch_one(ctx, gk_graph_node(graph, i));
     return *st == GK_STATUS_SUCCESS ? 1 : 0;
+}
+
+// GK_CUDA_GRAPH_DUMP=N: print every graph of at least N nodes, once per
+// distinct node count, as one line per node - op, name, extents, sources.
+// This is how a fusion candidate is found: the op profile says which ops
+// cost, this says which ops are *adjacent* and who else reads them.
+static void gk_cu_graph_dump(struct gk_cgraph * graph, int n) {
+    static long min_n = -2;
+    if (min_n == -2) {
+        const char * e = getenv("GK_CUDA_GRAPH_DUMP");
+        min_n = e != NULL && e[0] != '\0' ? strtol(e, NULL, 10) : -1;
+    }
+    if (min_n < 0 || n < min_n) {
+        return;
+    }
+
+    static std::unordered_map<int, bool> seen;
+    if (seen[n]) {
+        return;
+    }
+    seen[n] = true;
+
+    gk_logf("gk cuda graph dump: %d nodes\n", n);
+    for (int i = 0; i < n; ++i) {
+        const struct gk_tensor * t = gk_graph_node(graph, i);
+        char line[512];
+        int  off = snprintf(line, sizeof(line),
+                            "  %4d %-12s %-6s [%lld %lld %lld %lld] %s <-",
+                            i, gk_op_name(t->op), gk_type_name(t->type),
+                            (long long) t->ne[0], (long long) t->ne[1],
+                            (long long) t->ne[2], (long long) t->ne[3], t->name);
+        for (int s = 0; s < GK_MAX_SRC && t->src[s] != NULL && off < (int) sizeof(line) - 2; ++s) {
+            off += snprintf(line + off, sizeof(line) - (size_t) off, " %s[%lld,%lld,%lld,%lld]",
+                            t->src[s]->name,
+                            (long long) t->src[s]->ne[0], (long long) t->src[s]->ne[1],
+                            (long long) t->src[s]->ne[2], (long long) t->src[s]->ne[3]);
+        }
+        gk_logf("%s\n", line);
+    }
 }
 
 // The bare launch loop: every node in order, fused pairs as one. This is
@@ -893,12 +1322,14 @@ static inline int gk_cu_launch_planned(struct gk_cuda_backend_ctx * ctx,
 static enum gk_status gk_cuda_launch_nodes(struct gk_cuda_backend_ctx * ctx,
                                            struct gk_cgraph * graph, int n) {
     std::vector<uint8_t> tag;
-    gk_cu_fuse_plan(graph, n, tag);
+    std::vector<int32_t> aux;
+    gk_cu_fuse_plan(graph, n, tag, aux);
+    gk_cu_graph_dump(graph, n);
 
     int i = 0;
     while (i < n) {
         enum gk_status st;
-        const int took = gk_cu_launch_planned(ctx, graph, i, tag[(size_t) i], &st);
+        const int took = gk_cu_launch_planned(ctx, graph, i, tag[(size_t) i], aux, &st);
         if (took == 0) {
             return st;
         }
@@ -940,13 +1371,14 @@ static enum gk_status gk_cuda_launch_nodes_bucketed(struct gk_cuda_backend_ctx *
                                                     struct gk_cgraph * graph, int n,
                                                     struct gk_cu_graph_entry * ge, int bucket) {
     std::vector<uint8_t> tag;
-    gk_cu_fuse_plan(graph, n, tag);
+    std::vector<int32_t> aux;
+    gk_cu_fuse_plan(graph, n, tag, aux);
 
     GK_CUDA_CHECK(gk_cu_event_record_ext(ge->pev[0], ctx->stream));
     int i = 0;
     while (i < n) {
         enum gk_status st;
-        const int took = gk_cu_launch_planned(ctx, graph, i, tag[(size_t) i], &st);
+        const int took = gk_cu_launch_planned(ctx, graph, i, tag[(size_t) i], aux, &st);
         if (took == 0) {
             return st;
         }

@@ -935,6 +935,226 @@ void gk_cuda_fused_rms_mul(gkStream_t stream, const struct gk_tensor * norm,
         mul->ne[0] / 4, gk_get_op_params_f32(norm, 0));
 }
 
+// --------------------------------------------------------------------------
+// The tail fusions: the DiT patterns the adjacent pairs above cannot see.
+//
+// A DiT block separates a norm from the mul that consumes it by the handful
+// of tiny nodes that build the weight, gates its branches with per-token
+// vectors, and hand-builds rope out of repeat/mul/add - so its elementwise
+// cost is not launch latency but *traffic*: every intermediate is a 25-68 MB
+// tensor written and read straight back. The kernels here are the collapsed
+// forms. They are deliberately bit-exact against the chains they replace -
+// same per-element operations in the same order, same reduction geometry -
+// so an A/B against the unfused graph must produce the identical image; the
+// win is the elided round trips, not the arithmetic.
+//
+// The plan side (gk_cu_fuse_plan) is what proves a chain safe: single-use
+// intermediates, and no node between a chain's parts whose output was
+// allocated over storage the fused kernel still has to read.
+// --------------------------------------------------------------------------
+
+// rms_norm and a trailing weight mul, bit-exact: the sum is accumulated in
+// the same scalar strided order as gk_cu_k_norm, and the product is rounded
+// twice - (x*scale) then *w - exactly as the unfused pair rounds it.
+static __global__ void gk_cu_k_rms_norm_mul_x(const float * __restrict__ a,
+                                              const float * __restrict__ w,
+                                              float * __restrict__ d,
+                                              int64_t n, float eps) {
+    __shared__ float scratch[GK_CU_NORM_BLOCK / GK_WARP_SIZE];
+
+    a += blockIdx.x * n;
+    d += blockIdx.x * n;
+
+    float sumsq = 0.0f;
+    for (int64_t i = threadIdx.x; i < n; i += blockDim.x) {
+        const float v = a[i];
+        sumsq += v * v;
+    }
+    const float scale = rsqrtf(gk_cu_block_sum(sumsq, scratch) / (float) n + eps);
+
+    for (int64_t i = threadIdx.x; i < n; i += blockDim.x) {
+        d[i] = __fmul_rn(__fmul_rn(a[i], scale), w[i]);
+    }
+}
+
+// The residual add as well, still bit-exact; the sum is written - it is the
+// residual stream - and read back for the second pass, as in the _f kernel.
+static __global__ void gk_cu_k_add_rms_norm_mul_x(const float * a, const float * b,
+                                                  const float * __restrict__ w,
+                                                  float * da, float * __restrict__ dm,
+                                                  int64_t n, float eps) {
+    __shared__ float scratch[GK_CU_NORM_BLOCK / GK_WARP_SIZE];
+
+    a  += blockIdx.x * n;
+    b  += blockIdx.x * n;
+    da += blockIdx.x * n;
+    dm += blockIdx.x * n;
+
+    float sumsq = 0.0f;
+    for (int64_t i = threadIdx.x; i < n; i += blockDim.x) {
+        const float s = __fadd_rn(a[i], b[i]);
+        da[i] = s;
+        sumsq += s * s;
+    }
+    const float scale = rsqrtf(gk_cu_block_sum(sumsq, scratch) / (float) n + eps);
+
+    for (int64_t i = threadIdx.x; i < n; i += blockDim.x) {
+        dm[i] = __fmul_rn(__fmul_rn(da[i], scale), w[i]);
+    }
+}
+
+// out = c + y*g (+ t): the gate/modulate cluster. g and t are one row,
+// broadcast down the tensor - the DiT's per-block modulation vectors.
+static __global__ void gk_cu_k_madd_row(const float * __restrict__ c,
+                                        const float * __restrict__ y,
+                                        const float * __restrict__ g,
+                                        const float * __restrict__ t,
+                                        float * __restrict__ dst, int64_t ne0) {
+    const int64_t i = (int64_t) blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= ne0) {
+        return;
+    }
+    const int64_t off = (int64_t) blockIdx.y * ne0 + i;
+
+    float v = __fadd_rn(c[off], __fmul_rn(y[off], g[i]));
+    if (t != NULL) {
+        v = __fadd_rn(v, t[i]);
+    }
+    dst[off] = v;
+}
+
+// out = unary(x) * y: the gate activations - attention gates, and the MLP's
+// geglu when the allocator left the gate projection readable.
+static __global__ void gk_cu_k_unary_mul(const float * __restrict__ x,
+                                         const float * __restrict__ y,
+                                         float * __restrict__ dst, int64_t n,
+                                         int uop, float p1, float p2, float p3, float p4) {
+    const int64_t i = (int64_t) blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= n) {
+        return;
+    }
+    dst[i] = __fmul_rn(gk_cu_unary(uop, x[i], p1, p2, p3, p4), y[i]);
+}
+
+// The hand-built rope pair: add(mul(repeat(x1), f1), mul(repeat(x2), f2)),
+// where each x is [1, K, T, H], each f is [2, K, T, 1] and the output is
+// [2, K, T, H]. The repeats materialize x twice at full width and the two
+// products are read straight back by the add; collapsed, each x element is
+// read once and each output pair written once. The grid is (K*T, H) with
+// no per-element division - a two-element row is exactly the shape the flat
+// elementwise path handles worst.
+static __global__ void gk_cu_k_rope_pair(const float * __restrict__ x1,
+                                         const float * __restrict__ x2,
+                                         const float * __restrict__ f1,
+                                         const float * __restrict__ f2,
+                                         float2 * __restrict__ dst, int64_t nkt) {
+    const int64_t i = (int64_t) blockIdx.x * blockDim.x + threadIdx.x;
+    if (i >= nkt) {
+        return;
+    }
+    const int64_t off = (int64_t) blockIdx.y * nkt + i;
+
+    const float2 a = *(const float2 *) (f1 + 2 * i);
+    const float2 b = *(const float2 *) (f2 + 2 * i);
+    const float v1 = x1[off];
+    const float v2 = x2[off];
+
+    dst[off] = make_float2(__fadd_rn(__fmul_rn(v1, a.x), __fmul_rn(v2, b.x)),
+                           __fadd_rn(__fmul_rn(v1, a.y), __fmul_rn(v2, b.y)));
+}
+
+void gk_cuda_fused_rms_mul_x(gkStream_t stream, const struct gk_tensor * norm,
+                             const struct gk_tensor * mul) {
+    const struct gk_tensor * a = norm->src[0];
+    const struct gk_tensor * w = mul->src[0] == norm ? mul->src[1] : mul->src[0];
+
+    const int64_t rows = mul->ne[1] * mul->ne[2] * mul->ne[3];
+    if (rows <= 0 || mul->ne[0] <= 0) {
+        return;
+    }
+
+    gk_cu_k_rms_norm_mul_x<<<(int) rows, GK_CU_NORM_BLOCK, 0, stream>>>(
+        (const float *) a->data, (const float *) w->data, (float *) mul->data,
+        mul->ne[0], gk_get_op_params_f32(norm, 0));
+}
+
+void gk_cuda_fused_add_rms_mul_x(gkStream_t stream, const struct gk_tensor * add,
+                                 const struct gk_tensor * norm, const struct gk_tensor * mul) {
+    const struct gk_tensor * w = mul->src[0] == norm ? mul->src[1] : mul->src[0];
+
+    const int64_t rows = mul->ne[1] * mul->ne[2] * mul->ne[3];
+    if (rows <= 0 || mul->ne[0] <= 0) {
+        return;
+    }
+
+    gk_cu_k_add_rms_norm_mul_x<<<(int) rows, GK_CU_NORM_BLOCK, 0, stream>>>(
+        (const float *) add->src[0]->data, (const float *) add->src[1]->data,
+        (const float *) w->data,
+        (float *) add->data, (float *) mul->data,
+        mul->ne[0], gk_get_op_params_f32(norm, 0));
+}
+
+// `mul` is the y*g product, `add` its consumer, `add2` the optional trailing
+// shift; the plan verified there is exactly one row-vector operand in each.
+void gk_cuda_fused_madd(gkStream_t stream, const struct gk_tensor * mul,
+                        const struct gk_tensor * add, const struct gk_tensor * add2) {
+    const struct gk_tensor * g = mul->src[1]->ne[1] == 1 && mul->src[1]->ne[2] == 1 &&
+                                 mul->src[1]->ne[3] == 1 ? mul->src[1] : mul->src[0];
+    const struct gk_tensor * y = g == mul->src[0] ? mul->src[1] : mul->src[0];
+    const struct gk_tensor * c = add->src[0] == mul ? add->src[1] : add->src[0];
+    const struct gk_tensor * t = add2 != NULL
+        ? (add2->src[0] == add ? add2->src[1] : add2->src[0]) : NULL;
+    const struct gk_tensor * d = add2 != NULL ? add2 : add;
+
+    const int64_t ne0  = d->ne[0];
+    const int64_t rows = d->ne[1] * d->ne[2] * d->ne[3];
+    if (rows <= 0 || ne0 <= 0) {
+        return;
+    }
+
+    dim3 grid((unsigned) ((ne0 + GK_CUDA_BLOCK - 1) / GK_CUDA_BLOCK), (unsigned) rows);
+    gk_cu_k_madd_row<<<grid, GK_CUDA_BLOCK, 0, stream>>>(
+        (const float *) c->data, (const float *) y->data, (const float *) g->data,
+        t != NULL ? (const float *) t->data : NULL, (float *) d->data, ne0);
+}
+
+void gk_cuda_fused_unary_mul(gkStream_t stream, const struct gk_tensor * un,
+                             const struct gk_tensor * mul) {
+    const struct gk_tensor * y = mul->src[0] == un ? mul->src[1] : mul->src[0];
+
+    const int64_t n = mul->ne[0] * mul->ne[1] * mul->ne[2] * mul->ne[3];
+    if (n <= 0) {
+        return;
+    }
+
+    gk_cu_k_unary_mul<<<(unsigned) ((n + GK_CUDA_BLOCK - 1) / GK_CUDA_BLOCK),
+                        GK_CUDA_BLOCK, 0, stream>>>(
+        (const float *) un->src[0]->data, (const float *) y->data, (float *) mul->data, n,
+        (int) gk_get_unary_op(un),
+        gk_get_op_params_f32(un, 1), gk_get_op_params_f32(un, 2),
+        gk_get_op_params_f32(un, 3), gk_get_op_params_f32(un, 4));
+}
+
+void gk_cuda_fused_rope_pair(gkStream_t stream, const struct gk_tensor * m1,
+                             const struct gk_tensor * m2, const struct gk_tensor * add) {
+    const struct gk_tensor * r1 = m1->src[0]->op == GK_OP_REPEAT ? m1->src[0] : m1->src[1];
+    const struct gk_tensor * f1 = r1 == m1->src[0] ? m1->src[1] : m1->src[0];
+    const struct gk_tensor * r2 = m2->src[0]->op == GK_OP_REPEAT ? m2->src[0] : m2->src[1];
+    const struct gk_tensor * f2 = r2 == m2->src[0] ? m2->src[1] : m2->src[0];
+
+    const int64_t nkt = add->ne[1] * add->ne[2];   // K*T
+    const int64_t nh  = add->ne[3];
+    if (nkt <= 0 || nh <= 0) {
+        return;
+    }
+
+    dim3 grid((unsigned) ((nkt + GK_CUDA_BLOCK - 1) / GK_CUDA_BLOCK), (unsigned) nh);
+    gk_cu_k_rope_pair<<<grid, GK_CUDA_BLOCK, 0, stream>>>(
+        (const float *) r1->src[0]->data, (const float *) r2->src[0]->data,
+        (const float *) f1->data, (const float *) f2->data,
+        (float2 *) add->data, nkt);
+}
+
 // Group norm's statistic spans a group of channels and their whole spatial
 // extent, so the unit of work is a group rather than a row.
 // A group of a contiguous f32 tensor is a contiguous span: the groups partition
