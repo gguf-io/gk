@@ -94,6 +94,13 @@ static __device__ __forceinline__ float2 gk_cu_h2f2(const uint8_t * p) {
     return __half22float2(h);
 }
 
+// The same pair, already in a register - for a header that was staged raw.
+static __device__ __forceinline__ float2 gk_cu_h2f2_w(uint32_t w) {
+    __half2 h;
+    memcpy(&h, &w, sizeof(h));
+    return __half22float2(h);
+}
+
 static __device__ __forceinline__ float gk_cu_bf2f(uint16_t bits) {
     const uint32_t u = (uint32_t) bits << 16;
     float f;

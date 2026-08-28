@@ -3146,6 +3146,401 @@ void gk_cu_k_mul_mat_mma_q8(gk_tview a, gk_tview_mut d,
 }
 
 // --------------------------------------------------------------------------
+// The q2_K pipeline tile: the 128x128 integer tile above, its staging
+// double-buffered through cp.async.
+//
+// Investigation 10 left that tile bound on the *latency* of its own staging
+// loads: post-fix ncu read long_scoreboard 32%, issue 49%, no pipe
+// saturated. Its round is stage -> sync -> compute -> sync, so inside a
+// block nothing overlaps anything; the second block per SM was all the
+// overlap it had. This kernel overlaps a whole round: while round g
+// computes, every staging word of round g+1 is already in flight - and
+// `cp.async` is what makes that free, because the copy never lands in a
+// register, so there is no scoreboard for the issuing warp to wait on.
+//
+// Three q2_K facts make the stage smaller as well as asynchronous, and they
+// are why this is a q2_K kernel rather than a template:
+//
+//   * the k loop steps by two groups and a superblock holds eight, so a
+//     round's pair of groups always shares one 32-byte code run (sub and
+//     sub+1 sit in the same half, with shifts s and s+2). The codes are
+//     staged *raw*, once per pair, and folded at fragment load - where the
+//     synchronous tile stages decoded codes once per group;
+//   * the pair's four scale/minimum bytes are one *aligned* word
+//     (`blk + 2*sub` with sub even), and d/dmin at byte 80 another - so the
+//     whole weight header is two cp.async words per row per round;
+//   * the sub-scale fold (gk_cu_fold_subscale) keeps the fragment-time
+//     decode to a shift, a mask and one byte-parallel multiply per word.
+//
+// Ten words per row per round against the synchronous tile's eighteen, all
+// asynchronous, and the double buffer of everything still sits at ~35 KB -
+// under the 48 KB static limit, and two blocks per SM fit in Ada's 99.
+//
+// Rows and columns past the edge are zeroed once in the prologue and never
+// staged again; with zero codes, zero d and zero dmin every term they
+// contribute is zero, so neither the stage nor the compute carries bounds
+// arithmetic. A round whose second group is past n_grp skips that group's
+// compute block-uniformly.
+//
+// `GK_MM_MMA_PIPE=0` sends q2_K back to the synchronous tile - a bisect
+// lever, not a setting.
+// --------------------------------------------------------------------------
+
+// A 4-byte global->shared copy that never touches a register. Guarded like
+// the s8 mma helpers: where that instruction compiles (sm_80+), so does
+// cp.async. 4 bytes rather than 16 because q2_K's 84-byte blocks and the
+// 36-byte activation structs guarantee word alignment and nothing more.
+static __device__ __forceinline__ void gk_cu_cp_async4(void * dst, const void * src) {
+#if defined(GK_CU_HAVE_MMA)
+    const unsigned s = (unsigned) __cvta_generic_to_shared(dst);
+    asm volatile("cp.async.ca.shared.global [%0], [%1], 4;" :: "r"(s), "l"(src));
+#else
+    *(int *) dst = *(const int *) src;
+#endif
+}
+
+static __device__ __forceinline__ void gk_cu_cp_async_commit() {
+#if defined(GK_CU_HAVE_MMA)
+    asm volatile("cp.async.commit_group;");
+#endif
+}
+
+// Wait until at most N commit groups are still in flight.
+template <int N>
+static __device__ __forceinline__ void gk_cu_cp_async_wait() {
+#if defined(GK_CU_HAVE_MMA)
+    asm volatile("cp.async.wait_group %0;" :: "n"(N));
+#endif
+}
+
+static __global__ __launch_bounds__(GK_CU_MMAQ_THREADS, 2)
+void gk_cu_k_mul_mat_mma_q2k_pipe(gk_tview a, gk_tview_mut d,
+                                  const gk_cu_q8blk * aq, const float * ap,
+                                  int64_t n_grp, int64_t r2, int64_t r3) {
+    // Everything the compute phase reads is double-buffered; the weight side
+    // is raw (see above), the activation side is the same codes and
+    // transposed planes the synchronous tile stages.
+    __shared__ int      Ar [2][GK_CU_MMAQ_TILE_M][9];       // the pair's qs words (8 + pad)
+    __shared__ uint32_t Ahd[2][GK_CU_MMAQ_TILE_M];          // s0,s1 of group g, then of g+1
+    __shared__ uint32_t Add[2][GK_CU_MMAQ_TILE_M];          // d, dmin as raw halves
+    __shared__ int      Bs [2][2][GK_CU_MMAQ_TILE_N][9];    // [buf][sg][col][word + pad]
+    __shared__ float    Apl[2][2][3][GK_CU_MMAQ_TILE_N];    // d, d*s, d*sl planes
+
+    const int lane  = threadIdx.x % GK_WARP_SIZE;
+    const int warp  = threadIdx.x / GK_WARP_SIZE;
+    const int group = lane / 4;
+    const int tig   = lane % 4;
+
+    const int warp_m = warp / GK_CU_MMAQ_WARPS_N;
+    const int warp_n = warp % GK_CU_MMAQ_WARPS_N;
+
+    const int64_t m0  = (int64_t) blockIdx.x * GK_CU_MMAQ_TILE_M;
+    const int64_t n0  = (int64_t) blockIdx.y * GK_CU_MMAQ_TILE_N;
+    const int64_t i23 = blockIdx.z;
+
+    const int64_t i2 = i23 % d.ne[2];
+    const int64_t i3 = i23 / d.ne[2];
+
+    const int64_t a2 = i2 / r2;
+    const int64_t a3 = i3 / r3;
+
+    const int64_t n_rows = d.ne[0];
+    const int64_t n_cols = d.ne[1];
+
+    const gk_cu_q8blk * aq23 = aq + i23 * n_cols * n_grp;
+    const float *       ap23 = ap + i23 * n_cols * n_grp * 3;
+
+    static_assert(GK_CU_MMAQ_KSTEP == 2 && GK_CU_MMAQ_TILE_M == 128 &&
+                  GK_CU_MMAQ_TILE_N == 128 && GK_CU_MMAQ_THREADS == 256,
+                  "the pipeline stage assumes this geometry");
+
+    // Stage geometry, as in the synchronous tile: four lanes to a cluster,
+    // two adjacent words each, and every base pointer hoisted out of the k
+    // loop because a thread only ever touches the same two rows and columns.
+    const int stage_w = 2 * ((int) threadIdx.x % 4);
+    const int stage_c = (int) threadIdx.x / 4;
+
+    const uint8_t * frow[2] = { NULL, NULL };
+#pragma unroll
+    for (int j = 0; j < 2; ++j) {
+        const int64_t m = m0 + stage_c + j * 64;
+        if (m < n_rows) {
+            frow[j] = (const uint8_t *) gk_cu_row(a, m, a2, a3);
+        }
+    }
+
+    // The header stage: threads 0..127 fetch the scale/min word, threads
+    // 128..255 the d/dmin word, each for row threadIdx.x % 128.
+    const int       hdr_r   = (int) threadIdx.x % GK_CU_MMAQ_TILE_M;
+    const bool      hdr_dd  = (int) threadIdx.x >= GK_CU_MMAQ_TILE_M;
+    const uint8_t * hdr_row = m0 + hdr_r < n_rows
+        ? (const uint8_t *) gk_cu_row(a, m0 + hdr_r, a2, a3) : NULL;
+
+    const gk_cu_q8blk * bblk[2] = { NULL, NULL };
+#pragma unroll
+    for (int j = 0; j < 2; ++j) {
+        const int64_t n = n0 + stage_c + j * 64;
+        if (n < n_cols) {
+            bblk[j] = aq23 + n * n_grp;
+        }
+    }
+
+    // The scalar planes: thread (col, sg) copies its three words.
+    const int     pl_c = (int) threadIdx.x % GK_CU_MMAQ_TILE_N;
+    const int     pl_s = (int) threadIdx.x / GK_CU_MMAQ_TILE_N;
+    const bool    pl_ok = n0 + pl_c < n_cols;
+
+    // Rows and columns past the edge, zeroed once in both buffers. The
+    // stage never writes them again, so they stay zero and contribute zero.
+    {
+        const int x = (int) threadIdx.x % GK_CU_MMAQ_TILE_M;
+        const int h = (int) threadIdx.x / GK_CU_MMAQ_TILE_M;
+
+        if (m0 + x >= n_rows) {
+            if (h == 0) {
+#pragma unroll
+                for (int b = 0; b < 2; ++b) {
+#pragma unroll
+                    for (int i = 0; i < 8; ++i) { Ar[b][x][i] = 0; }
+                }
+            } else {
+#pragma unroll
+                for (int b = 0; b < 2; ++b) {
+                    Ahd[b][x] = 0;
+                    Add[b][x] = 0;
+                }
+            }
+        }
+        if (n0 + x >= n_cols) {
+            if (h == 0) {
+#pragma unroll
+                for (int b = 0; b < 2; ++b) {
+#pragma unroll
+                    for (int sg = 0; sg < 2; ++sg) {
+#pragma unroll
+                        for (int i = 0; i < 8; ++i) { Bs[b][sg][x][i] = 0; }
+                    }
+                }
+            } else {
+#pragma unroll
+                for (int b = 0; b < 2; ++b) {
+#pragma unroll
+                    for (int sg = 0; sg < 2; ++sg) {
+#pragma unroll
+                        for (int q = 0; q < 3; ++q) { Apl[b][sg][q][x] = 0.0f; }
+                    }
+                }
+            }
+        }
+    }
+
+    const auto stage = [&](int64_t it, int buf) {
+        const int64_t g   = it * 2;
+        const int64_t sb  = g >> 3;          // the pair's shared superblock
+        const int     sub = (int) (g & 7);   // even, so g+1 shares its 32-byte half
+
+        // the pair's code run, fetched once
+#pragma unroll
+        for (int j = 0; j < 2; ++j) {
+            const uint8_t * rp = frow[j];
+            if (rp != NULL) {
+                const uint8_t * qs = rp + sb * (GK_QK / 16 + GK_QK / 4 + 4)
+                                   + GK_QK / 16 + (sub / 4) * 32;
+                const int r = stage_c + j * 64;
+                gk_cu_cp_async4(&Ar[buf][r][stage_w    ], qs + 4 * stage_w);
+                gk_cu_cp_async4(&Ar[buf][r][stage_w + 1], qs + 4 * stage_w + 4);
+            }
+        }
+
+        // the two header words
+        if (hdr_row != NULL) {
+            const uint8_t * blk = hdr_row + sb * (GK_QK / 16 + GK_QK / 4 + 4);
+            if (!hdr_dd) {
+                gk_cu_cp_async4(&Ahd[buf][hdr_r], blk + 2 * sub);
+            } else {
+                gk_cu_cp_async4(&Add[buf][hdr_r], blk + GK_QK / 16 + GK_QK / 4);
+            }
+        }
+
+        // the activation codes
+#pragma unroll
+        for (int it2 = 0; it2 < 4; ++it2) {
+            const int j  = it2 & 1;
+            const int sg = it2 >> 1;
+            const int c  = stage_c + j * 64;
+            const int64_t gk = g + sg;
+
+            const gk_cu_q8blk * bp = bblk[j];
+            if (bp != NULL && gk < n_grp) {
+                gk_cu_cp_async4(&Bs[buf][sg][c][stage_w    ], &bp[gk].q[stage_w    ]);
+                gk_cu_cp_async4(&Bs[buf][sg][c][stage_w + 1], &bp[gk].q[stage_w + 1]);
+            }
+        }
+
+        // the scalar planes
+        {
+            const int64_t gk = g + pl_s;
+            if (pl_ok && gk < n_grp) {
+                const float * p = ap23 + gk * 3 * n_cols + (n0 + pl_c);
+#pragma unroll
+                for (int q = 0; q < 3; ++q) {
+                    gk_cu_cp_async4(&Apl[buf][pl_s][q][pl_c], p + q * n_cols);
+                }
+            }
+        }
+    };
+
+    float acc[GK_CU_MMAQ_WMT][GK_CU_MMAQ_WNT][4];
+#pragma unroll
+    for (int wt = 0; wt < GK_CU_MMAQ_WMT; ++wt) {
+#pragma unroll
+        for (int ct = 0; ct < GK_CU_MMAQ_WNT; ++ct) {
+#pragma unroll
+            for (int i = 0; i < 4; ++i) {
+                acc[wt][ct][i] = 0.0f;
+            }
+        }
+    }
+
+    const int64_t n_iter = (n_grp + 1) / 2;
+
+    stage(0, 0);
+    gk_cu_cp_async_commit();
+
+    for (int64_t it = 0; it < n_iter; ++it) {
+        const int buf = (int) (it & 1);
+
+        // Round it+1 goes into the other buffer before this round computes;
+        // the trailing barrier of round it-1 is what makes that safe. Then
+        // wait for this round's own group - with one still in flight when a
+        // next round exists, none at the tail.
+        if (it + 1 < n_iter) {
+            stage(it + 1, buf ^ 1);
+            gk_cu_cp_async_commit();
+            gk_cu_cp_async_wait<1>();
+        } else {
+            gk_cu_cp_async_wait<0>();
+        }
+        __syncthreads();
+
+        const int64_t g   = it * 2;
+        const int     sub = (int) (g & 7);
+        const int     sh0 = 2 * (sub & 3);
+
+        // The raw words and headers serve both groups, so they are read
+        // once per round and decoded per group.
+        int      aw [GK_CU_MMAQ_WMT][4];
+        uint32_t s01[GK_CU_MMAQ_WMT][2];
+        float2   dd [GK_CU_MMAQ_WMT][2];
+
+#pragma unroll
+        for (int wt = 0; wt < GK_CU_MMAQ_WMT; ++wt) {
+            const int r_lo = warp_m * GK_CU_MMAQ_WM + wt * 16 + group;
+
+            aw[wt][0] = Ar[buf][r_lo    ][tig];
+            aw[wt][1] = Ar[buf][r_lo + 8][tig];
+            aw[wt][2] = Ar[buf][r_lo    ][4 + tig];
+            aw[wt][3] = Ar[buf][r_lo + 8][4 + tig];
+
+            s01[wt][0] = Ahd[buf][r_lo    ];
+            s01[wt][1] = Ahd[buf][r_lo + 8];
+            dd [wt][0] = gk_cu_h2f2_w(Add[buf][r_lo    ]);
+            dd [wt][1] = gk_cu_h2f2_w(Add[buf][r_lo + 8]);
+        }
+
+#pragma unroll
+        for (int gg = 0; gg < 2; ++gg) {
+            if (g + gg >= n_grp) {
+                break;
+            }
+
+            const int sh   = sh0 + 2 * gg;   // this group's code shift
+            const int sb16 = 16 * gg;        // where its bytes sit in the header word
+
+            // The fold, at fragment time: shift, mask, one byte-parallel
+            // multiply per word - and the header's minima become the offset
+            // planes the drain wants.
+            int   af [GK_CU_MMAQ_WMT][4];
+            float ws [GK_CU_MMAQ_WMT][2];
+            float wo [GK_CU_MMAQ_WMT][2];
+            float woh[GK_CU_MMAQ_WMT][2];
+
+#pragma unroll
+            for (int wt = 0; wt < GK_CU_MMAQ_WMT; ++wt) {
+#pragma unroll
+                for (int rh = 0; rh < 2; ++rh) {
+                    const uint32_t s = s01[wt][rh] >> sb16;
+
+                    af[wt][rh    ] = (int) ((uint32_t) ((aw[wt][rh    ] >> sh) & 0x03030303)
+                                            * (s & 0xf));
+                    af[wt][rh + 2] = (int) ((uint32_t) ((aw[wt][rh + 2] >> sh) & 0x03030303)
+                                            * ((s >> 8) & 0xf));
+
+                    ws [wt][rh] = dd[wt][rh].x;
+                    wo [wt][rh] = -dd[wt][rh].y * (float) ((s >>  4) & 0xf);
+                    woh[wt][rh] = -dd[wt][rh].y * (float) ((s >> 12) & 0xf);
+                }
+            }
+
+#pragma unroll
+            for (int ct = 0; ct < GK_CU_MMAQ_WNT; ++ct) {
+                const int c = warp_n * GK_CU_MMAQ_WN + ct * 8 + group;
+
+                int bf[2];
+                bf[0] = Bs[buf][gg][c][tig];
+                bf[1] = Bs[buf][gg][c][4 + tig];
+
+                const int cd = warp_n * GK_CU_MMAQ_WN + ct * 8 + tig * 2;
+
+                float adv[2], alv[2], ahv[2];
+                adv[0] = Apl[buf][gg][0][cd + 0];
+                adv[1] = Apl[buf][gg][0][cd + 1];
+                alv[0] = Apl[buf][gg][2][cd + 0];
+                alv[1] = Apl[buf][gg][2][cd + 1];
+                ahv[0] = Apl[buf][gg][1][cd + 0] - alv[0];
+                ahv[1] = Apl[buf][gg][1][cd + 1] - alv[1];
+
+#pragma unroll
+                for (int wt = 0; wt < GK_CU_MMAQ_WMT; ++wt) {
+                    int df[4] = { 0, 0, 0, 0 };
+
+                    gk_cu_mma_s8_k32(df, af[wt], bf);
+
+#pragma unroll
+                    for (int i = 0; i < 4; ++i) {
+                        const int rh = i >> 1;      // row half of the mma tile
+                        const int ch = i & 1;       // which of the lane's columns
+                        acc[wt][ct][i] += ws[wt][rh]  * adv[ch] * (float) df[i]
+                                        + wo[wt][rh]  * alv[ch]
+                                        + woh[wt][rh] * ahv[ch];
+                    }
+                }
+            }
+        }
+
+        __syncthreads();
+    }
+
+#pragma unroll
+    for (int wt = 0; wt < GK_CU_MMAQ_WMT; ++wt) {
+#pragma unroll
+        for (int ct = 0; ct < GK_CU_MMAQ_WNT; ++ct) {
+#pragma unroll
+            for (int i = 0; i < 4; ++i) {
+                const int64_t m = m0 + warp_m * GK_CU_MMAQ_WM + wt * 16
+                                + group + (i >= 2 ? 8 : 0);
+                const int64_t n = n0 + warp_n * GK_CU_MMAQ_WN + ct * 8
+                                + tig * 2 + (i & 1);
+
+                if (m < n_rows && n < n_cols) {
+                    gk_cu_set(d, m, n, i2, i3, acc[wt][ct][i]);
+                }
+            }
+        }
+    }
+}
+
+// --------------------------------------------------------------------------
 // The narrow integer tile: 2..23 columns, the shape of a speculative verify.
 //
 // The NC dp4a mat-vec covers this range, and at four columns it is issue
@@ -3912,6 +4307,17 @@ void gk_cuda_mul_mat(gkStream_t stream, struct gk_cuda_scratch * scratch,
                     mgrid.x = (unsigned) ((dst->ne[0] + GK_CU_MMAQ_TILE_M - 1) / GK_CU_MMAQ_TILE_M);
                     mgrid.y = (unsigned) ((n_cols     + GK_CU_MMAQ_TILE_N - 1) / GK_CU_MMAQ_TILE_N);
                     mgrid.z = (unsigned) n_23;
+
+                    // q2_K takes the cp.async pipeline tile.
+                    // `GK_MM_MMA_PIPE=0` puts it back on the synchronous
+                    // tile - a bisect lever, not a setting.
+                    if ((int) src0->type == GK_TYPE_Q2_K &&
+                        gk_cu_env_int("GK_MM_MMA_PIPE", 1) != 0) {
+                        g_gk_mm_path = "mma-q8p";
+                        gk_cu_k_mul_mat_mma_q2k_pipe<<<mgrid, GK_CU_MMAQ_THREADS, 0, stream>>>(
+                            gk_cu_view(src0), gk_cu_view_mut(dst), aq, ap, n_grp, r2, r3);
+                        return;
+                    }
 
 #define GK_CU_LAUNCH_MMA_Q8(T)                                                            \
                     gk_cu_k_mul_mat_mma_q8<T><<<mgrid, GK_CU_MMAQ_THREADS, 0, stream>>>(   \
