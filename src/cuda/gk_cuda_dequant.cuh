@@ -85,6 +85,15 @@ static __device__ __forceinline__ float gk_cu_h2f(const uint8_t * p) {
     return __half2float(h);
 }
 
+// Two consecutive halves as floats, one 4-byte load. The pointer must be
+// 4-byte aligned; a d/dmin pair at a 4-aligned offset of a 4-aligned block
+// (q2_K's, at byte 80 of 84) qualifies.
+static __device__ __forceinline__ float2 gk_cu_h2f2(const uint8_t * p) {
+    __half2 h;
+    memcpy(&h, p, sizeof(h));
+    return __half22float2(h);
+}
+
 static __device__ __forceinline__ float gk_cu_bf2f(uint16_t bits) {
     const uint32_t u = (uint32_t) bits << 16;
     float f;
@@ -972,6 +981,22 @@ static __device__ __host__ __forceinline__ constexpr bool gk_cu_has_split_scale(
            TYPE == GKT_NVFP4;
 }
 
+// Whether the format's per-16 sub-scale is a small enough integer to fold
+// into the codes at staging time, which turns a split-scale group back into a
+// uniform-scale one: `d*(sc*code)` dots the same as `(d*sc)*code`, and a
+// folded code is still an int8 fragment. q2_K is the whole list - its codes
+// are 0..3 against a 4-bit sub-scale, so a folded code is at most 45. q3_K's
+// signed 6-bit scale against -4..3 reaches +128 and q6_K's is in the
+// thousands, so neither fits; nvfp4's ue4m3 is not an integer at all.
+//
+// Only the scale folds. The offset (dmin times a per-16 minimum) still
+// changes at element sixteen, so a folded group is one scale, two offsets -
+// the drain keeps the split offset term and drops the split windows.
+template <int TYPE>
+static __device__ __host__ __forceinline__ constexpr bool gk_cu_fold_subscale() {
+    return TYPE == GKT_Q2_K;
+}
+
 template <int TYPE>
 static __device__ __host__ __forceinline__ constexpr bool gk_cu_has_dp4a() {
     return TYPE == GKT_Q4_0 || TYPE == GKT_Q4_1 ||
@@ -1486,6 +1511,43 @@ static __device__ __forceinline__ void gk_cu_wblk32(const uint8_t * row, int64_t
     }
     scale [0] = scale [1] = 0.0f;
     offset[0] = offset[1] = 0.0f;
+}
+
+// gk_cu_wblk32 for the formats gk_cu_fold_subscale admits, with the integer
+// sub-scale multiplied into the codes: the group comes back uniform-scale -
+// `scale[0]` alone, the block-wide d - and a k32 window spans it whole. Each
+// byte's product is at most 3*15, so one 32-bit multiply folds four codes with
+// no carry crossing a byte. The offsets stay per sixteen; they are the drain's
+// problem, not the dot's.
+template <int TYPE>
+static __device__ __forceinline__ void gk_cu_wblk32_folded(const uint8_t * row, int64_t g,
+                                                           int (&codes)[8],
+                                                           float (&scale)[2], float (&offset)[2]) {
+    static_assert(gk_cu_fold_subscale<TYPE>(), "format's sub-scale does not fold");
+
+    const uint8_t * blk = row + (g / 8) * (GK_QK / 16 + GK_QK / 4 + 4);
+    const int       sub = (int) (g % 8);
+
+    const uint8_t * qs    = blk + GK_QK / 16 + (sub / 4) * 32;
+    const int       shift = 2 * (sub % 4);
+
+    const uint8_t  s0  = blk[2 * sub + 0];
+    const uint8_t  s1  = blk[2 * sub + 1];
+    const uint32_t sc0 = s0 & 0xf;
+    const uint32_t sc1 = s1 & 0xf;
+
+#pragma unroll
+    for (int i = 0; i < 4; ++i) {
+        codes[i]     = (int) ((uint32_t) ((gk_cu_int_b2(qs, i)     >> shift) & 0x03030303) * sc0);
+        codes[i + 4] = (int) ((uint32_t) ((gk_cu_int_b2(qs, i + 4) >> shift) & 0x03030303) * sc1);
+    }
+
+    const float d    = gk_cu_h2f(blk + GK_QK / 16 + GK_QK / 4);
+    const float dmin = gk_cu_h2f(blk + GK_QK / 16 + GK_QK / 4 + 2);
+
+    scale [0] = scale [1] = d;
+    offset[0] = -dmin * (float) (s0 >> 4);
+    offset[1] = -dmin * (float) (s1 >> 4);
 }
 
 // The dot of an *already decoded* 32-element weight group against one

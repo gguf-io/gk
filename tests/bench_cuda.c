@@ -470,6 +470,29 @@ ZIMG_MM(proj,  3840,  3840)
 ZIMG_MM(ffup,  3840, 10240)
 ZIMG_MM(ffdn, 10240,  3840)
 
+// The four matmuls a krea2 DiT step is made of, read off Investigation 9's
+// profile of an actual 8-step generation: 1038 tokens, hidden 6144,
+// feed-forward opening to 16384, and a fused 1536-row modulation projection.
+// At q2_K they were 83% of the step's device time. q2_K is the point of this
+// group: it is a split-scale format, so it drains the integer tile twice per
+// group where q4_K drains once - q4_K at the same shape is the control that
+// prices that drain, and f16 is the no-decode ceiling.
+#define KREA2_MM(name, k, rows)                                                          \
+    static struct gk_tensor * b_k2_##name##_q2k(struct gk_ctx * c) {                     \
+        return mul_mat_case(c, GK_TYPE_Q2_K,  (k), (rows), 1038);                        \
+    }                                                                                    \
+    static struct gk_tensor * b_k2_##name##_f16(struct gk_ctx * c) {                     \
+        return mul_mat_case(c, GK_TYPE_F16,   (k), (rows), 1038);                        \
+    }                                                                                    \
+    static struct gk_tensor * b_k2_##name##_q4k(struct gk_ctx * c) {                     \
+        return mul_mat_case(c, GK_TYPE_Q4_K,  (k), (rows), 1038);                        \
+    }
+
+KREA2_MM(ffup,  6144, 16384)   // feed-forward in - the wide shape
+KREA2_MM(ffdn, 16384,  6144)   // feed-forward out - the deep-k shape
+KREA2_MM(proj,  6144,  6144)   // attention projection
+KREA2_MM(mod,   6144,  1536)   // modulation - short of rows
+
 // The four matmuls a MiniMax-H3 video DiT step is made of, read off a profile
 // of an actual 480x480x124 generation: 8742 tokens, hidden 5376, feed-forward
 // to 14336, and a fused qkv of 28672 rows. Between them they are 59% of a
@@ -1037,6 +1060,20 @@ static const struct bench_case g_cases[] = {
     { NULL,            "ff out    nvfp4", "7168x5376 n=8742",   b_h3_ffo_nv,   ARENA_HUGE },
     { NULL,            "ff out    f16",   "7168x5376 n=8742",   b_h3_ffo_f16,  ARENA_HUGE },
     { NULL,            "ff out    q4_K",  "7168x5376 n=8742",   b_h3_ffo_q4k,  ARENA_HUGE },
+
+    { "krea2 DiT matmuls (q2_K, against f16 and q4_K at the same shape)",
+                       "ff up     q2_K",  "6144x16384 n=1038",  b_k2_ffup_q2k, ARENA_BIG },
+    { NULL,            "ff up     f16",   "6144x16384 n=1038",  b_k2_ffup_f16, ARENA_BIG },
+    { NULL,            "ff up     q4_K",  "6144x16384 n=1038",  b_k2_ffup_q4k, ARENA_BIG },
+    { NULL,            "ff down   q2_K",  "16384x6144 n=1038",  b_k2_ffdn_q2k, ARENA_BIG },
+    { NULL,            "ff down   f16",   "16384x6144 n=1038",  b_k2_ffdn_f16, ARENA_BIG },
+    { NULL,            "ff down   q4_K",  "16384x6144 n=1038",  b_k2_ffdn_q4k, ARENA_BIG },
+    { NULL,            "attn proj q2_K",  "6144x6144 n=1038",   b_k2_proj_q2k, ARENA_BIG },
+    { NULL,            "attn proj f16",   "6144x6144 n=1038",   b_k2_proj_f16, ARENA_BIG },
+    { NULL,            "attn proj q4_K",  "6144x6144 n=1038",   b_k2_proj_q4k, ARENA_BIG },
+    { NULL,            "mod       q2_K",  "6144x1536 n=1038",   b_k2_mod_q2k,  ARENA_BIG },
+    { NULL,            "mod       f16",   "6144x1536 n=1038",   b_k2_mod_f16,  ARENA_BIG },
+    { NULL,            "mod       q4_K",  "6144x1536 n=1038",   b_k2_mod_q4k,  ARENA_BIG },
 
     { "Z-Image DiT matmuls (nvfp4, against f16 and q4_K at the same shape)",
                        "qkv       nvfp4", "3840x11520 n=1056",  b_zi_qkv_nv,   ARENA_BIG },
