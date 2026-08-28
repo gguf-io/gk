@@ -1112,6 +1112,13 @@ static struct gk_tensor * build_mmv_q6_K(struct gk_ctx * ctx, struct gk_tensor *
     return mmq_case(ctx, in, n_in, GK_TYPE_Q6_K, 512, 700, 1);
 }
 
+// The wide tile for q2_K - the shape class a q2_K DiT runs all step long.
+// q2_K carries a per-16 offset as well as a per-16 scale, so this is the case
+// that exercises the two-window drain's `Adl` term at full width.
+static struct gk_tensor * build_mmq_q2_K(struct gk_ctx * ctx, struct gk_tensor ** in, int * n_in) {
+    return mmq_case(ctx, in, n_in, GK_TYPE_Q2_K, 512, 700, 70);
+}
+
 // One super-block of k, so the group-to-super-block indexing never crosses a
 // boundary; if this agrees and the wider one drifts, the drift is accumulation.
 static struct gk_tensor * build_mmv_q6_K_1sb(struct gk_ctx * ctx, struct gk_tensor ** in, int * n_in) {
@@ -2615,6 +2622,10 @@ int main(void) {
     failures += run_op_tol(gpu, "mmq q6_K",      build_mmq_q6_K,     8e-2f);
     failures += run_op_tol(gpu, "mmv q6_K",      build_mmv_q6_K,     8e-2f);
     failures += run_op_tol(gpu, "mmv q6_K 1sb",  build_mmv_q6_K_1sb, 8e-2f);
+    // The 2-bit encoder is noisy, so like mmn q2_K this carries the loose
+    // bound; what it checks is the wide tile's two-window drain, whose
+    // exactness against the dp4a tile GK_MM_MMA_SPLIT=0 can bisect.
+    failures += run_op_tol(gpu, "mmq q2_K",      build_mmq_q2_K,     2e-1f);
 
     // The deep mmq bounds are looser than the shallow ones: at k = 6656 the
     // CPU reference's per-256 activation scales cost ~0.1 relative on outputs

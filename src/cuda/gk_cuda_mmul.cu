@@ -2661,12 +2661,16 @@ static __global__ void gk_cu_k_mul_mat_tiled_q8(gk_tview a, gk_tview_mut d,
 // it are already computed and already staged: `Woff` from `gk_cu_wblk32`, and
 // the code sum in `gk_cu_q8blk::s`.
 //
-// The other difference from the pilot is the drain. nvfp4's sub-scale changes
-// every sixteen elements, so it runs two `m16n8k16` windows and converts the
-// accumulator to float between them. A k-quant's scale covers the whole
-// thirty-two, so one `m16n8k32` spans a group and the accumulator is drained
-// once per group instead of twice - halving what the pilot's own notes call
-// the whole cost of the format on tensor cores.
+// The other difference from the pilot is the drain. A whole-group format's
+// scale covers the whole thirty-two, so one `m16n8k32` spans a group and the
+// accumulator is drained once per group - halving what the pilot's own notes
+// call the whole cost of the format on tensor cores. A split-scale format -
+// q2_K, q3_K, q6_K, the split-scale lattice codes - changes scale at element
+// sixteen, so its group runs as two `m16n8k16` windows drained where the
+// scale changes, the same identity the narrow tile below documents. Twice
+// the drain, but still tensor cores: on the shapes that sent q2_K here it
+// measures ~1.7x the dp4a tile it used to fall back to, with ggml's mmq at
+// the same shapes still ~2x further on - the drain is now the wall.
 //
 // ## The tile is 128x128, and that matters more than the instruction
 //
@@ -2690,6 +2694,11 @@ static __global__ void gk_cu_k_mul_mat_tiled_q8(gk_tview a, gk_tview_mut d,
 #define GK_CU_MMAQ_TILE_N  128   // columns a block owns
 #define GK_CU_MMAQ_WARPS_M 4
 #define GK_CU_MMAQ_WARPS_N 2
+// k-groups staged per barrier - the narrow tile's round, at this tile's
+// thread count. 256 threads against 128 rows and 128 columns means exactly
+// two groups make one decode and one column load per thread per round, so
+// the barriers halve and every thread has two independent loads in flight.
+#define GK_CU_MMAQ_KSTEP   2
 #define GK_CU_MMAQ_WM      (GK_CU_MMAQ_TILE_M / GK_CU_MMAQ_WARPS_M)  // 32 rows a warp owns
 #define GK_CU_MMAQ_WN      (GK_CU_MMAQ_TILE_N / GK_CU_MMAQ_WARPS_N)  // 64 columns
 #define GK_CU_MMAQ_WMT     (GK_CU_MMAQ_WM / 16)                      // 2 mma row tiles
@@ -2703,15 +2712,26 @@ void gk_cu_k_mul_mat_mma_q8(gk_tview a, gk_tview_mut d,
                             int64_t r2, int64_t r3) {
     // Same staging as the nvfp4 tile: ints rather than bytes, so a fragment
     // read is a plain aligned load of the word a lane already wants.
-    __shared__ int   As[GK_CU_MMAQ_TILE_M][8];
-    __shared__ int   Bs[GK_CU_MMAQ_TILE_N][8];
-    __shared__ float Wsc[GK_CU_MMAQ_TILE_M];
-    __shared__ float Wof[GK_CU_MMAQ_TILE_M];
-    __shared__ float Ad [GK_CU_MMAQ_TILE_N];
+    //
+    // A split-scale format changes scale at element sixteen, so its rows
+    // carry two scale/offset planes and its group runs as two k16 windows
+    // below - the same shape the narrow tile gives these formats. Whole-group
+    // formats keep the single plane and the single k32 window.
+    __shared__ int   As[GK_CU_MMAQ_KSTEP][GK_CU_MMAQ_TILE_M][8];
+    __shared__ int   Bs[GK_CU_MMAQ_KSTEP][GK_CU_MMAQ_TILE_N][8];
+    __shared__ float Wsc[GK_CU_MMAQ_KSTEP][gk_cu_has_split_scale<ATYPE>() ? 2 : 1][GK_CU_MMAQ_TILE_M];
+    __shared__ float Wof[GK_CU_MMAQ_KSTEP][gk_cu_has_split_scale<ATYPE>() ? 2 : 1][GK_CU_MMAQ_TILE_M];
+    __shared__ float Ad [GK_CU_MMAQ_KSTEP][GK_CU_MMAQ_TILE_N];
     // The activation scale times its code sum. The offset term needs the two
     // only as a product, and folding them here turns a multiply per output per
-    // group into one per column per group.
-    __shared__ float Ads[GK_CU_MMAQ_TILE_N];
+    // group into one per column per group. `Adl` is the same product over the
+    // first sixteen codes, which is what the split drain's low window needs;
+    // the high window's sum is one subtract, as in the narrow tile.
+    __shared__ float Ads[GK_CU_MMAQ_KSTEP][GK_CU_MMAQ_TILE_N];
+    __shared__ float Adl[GK_CU_MMAQ_KSTEP][gk_cu_has_split_scale<ATYPE>() ? GK_CU_MMAQ_TILE_N : 1];
+
+    // The high plane's index, kept in bounds when the array has one plane.
+    constexpr int HI = gk_cu_has_split_scale<ATYPE>() ? 1 : 0;
 
     const int lane  = threadIdx.x % GK_WARP_SIZE;
     const int warp  = threadIdx.x / GK_WARP_SIZE;
@@ -2748,89 +2768,116 @@ void gk_cu_k_mul_mat_mma_q8(gk_tview a, gk_tview_mut d,
         }
     }
 
-    for (int64_t g = 0; g < n_grp; ++g) {
-        // Sixty-four threads take a weight row each, the other sixty-four an
-        // activation column each. A row or column past the end stages zeros,
-        // so the arithmetic below needs no bounds test.
-        if (threadIdx.x < GK_CU_MMAQ_TILE_M) {
-            const int     r = (int) threadIdx.x;
-            const int64_t m = m0 + r;
+    for (int64_t g = 0; g < n_grp; g += GK_CU_MMAQ_KSTEP) {
+        // Every thread decodes one weight row-group and loads one activation
+        // column-group: with 256 threads, 128 rows and two staged groups the
+        // units land one of each per thread. A row, column or group past the
+        // end stages zeros, so the arithmetic below needs no bounds test.
+        {
+            const int     r  = (int) threadIdx.x % GK_CU_MMAQ_TILE_M;
+            const int     sg = (int) threadIdx.x / GK_CU_MMAQ_TILE_M;
+            const int64_t m  = m0 + r;
+            const int64_t gk = g + sg;
 
-            int   codes[8];
+            int   codes[8] = { 0, 0, 0, 0, 0, 0, 0, 0 };
             float sc[2] = { 0.0f, 0.0f };
             float off[2] = { 0.0f, 0.0f };
 
-            if (m < n_rows) {
+            if (m < n_rows && gk < n_grp) {
                 gk_cu_wblk32<ATYPE>((const uint8_t *) gk_cu_row(a, m, a2, a3),
-                                    g, codes, sc, off);
-            } else {
-#pragma unroll
-                for (int i = 0; i < 8; ++i) {
-                    codes[i] = 0;
-                }
+                                    gk, codes, sc, off);
             }
 
 #pragma unroll
             for (int i = 0; i < 8; ++i) {
-                As[r][i] = codes[i];
+                As[sg][r][i] = codes[i];
             }
-            Wsc[r] = sc[0];
-            Wof[r] = off[0];
-        } else if (threadIdx.x < GK_CU_MMAQ_TILE_M + GK_CU_MMAQ_TILE_N) {
-            const int     c = (int) threadIdx.x - GK_CU_MMAQ_TILE_M;
-            const int64_t n = n0 + c;
+            Wsc[sg][0][r] = sc[0];
+            Wof[sg][0][r] = off[0];
+            if (gk_cu_has_split_scale<ATYPE>()) {
+                Wsc[sg][HI][r] = sc[1];
+                Wof[sg][HI][r] = off[1];
+            }
+        }
+        {
+            const int     c  = (int) threadIdx.x % GK_CU_MMAQ_TILE_N;
+            const int     sg = (int) threadIdx.x / GK_CU_MMAQ_TILE_N;
+            const int64_t n  = n0 + c;
+            const int64_t gk = g + sg;
 
-            if (n < n_cols) {
-                const gk_cu_q8blk & ab = aq23[n * n_grp + g];
+            if (n < n_cols && gk < n_grp) {
+                const gk_cu_q8blk & ab = aq23[n * n_grp + gk];
 #pragma unroll
                 for (int i = 0; i < 8; ++i) {
-                    Bs[c][i] = ab.q[i];
+                    Bs[sg][c][i] = ab.q[i];
                 }
-                Ad [c] = ab.d;
-                Ads[c] = ab.d * ab.s;
+                Ad [sg][c] = ab.d;
+                Ads[sg][c] = ab.d * ab.s;
+                if (gk_cu_has_split_scale<ATYPE>()) {
+                    Adl[sg][c] = ab.d * ab.sl;
+                }
             } else {
 #pragma unroll
                 for (int i = 0; i < 8; ++i) {
-                    Bs[c][i] = 0;
+                    Bs[sg][c][i] = 0;
                 }
-                Ad [c] = 0.0f;
-                Ads[c] = 0.0f;
+                Ad [sg][c] = 0.0f;
+                Ads[sg][c] = 0.0f;
+                if (gk_cu_has_split_scale<ATYPE>()) {
+                    Adl[sg][c] = 0.0f;
+                }
             }
         }
 
         __syncthreads();
+
+#pragma unroll
+        for (int gg = 0; gg < GK_CU_MMAQ_KSTEP; ++gg) {
 
         // Column constants first: both are the same for every row tile, so
         // reading them once per k-step rather than once per mma is the same
         // economy the nvfp4 tile makes for its activation scale.
         float adv[GK_CU_MMAQ_WNT][2];
         float asv[GK_CU_MMAQ_WNT][2];
+        float alv[GK_CU_MMAQ_WNT][2];
 #pragma unroll
         for (int ct = 0; ct < GK_CU_MMAQ_WNT; ++ct) {
             const int c = warp_n * GK_CU_MMAQ_WN + ct * 8 + tig * 2;
-            adv[ct][0] = Ad [c + 0];
-            adv[ct][1] = Ad [c + 1];
-            asv[ct][0] = Ads[c + 0];
-            asv[ct][1] = Ads[c + 1];
+            adv[ct][0] = Ad [gg][c + 0];
+            adv[ct][1] = Ad [gg][c + 1];
+            asv[ct][0] = Ads[gg][c + 0];
+            asv[ct][1] = Ads[gg][c + 1];
+            if (gk_cu_has_split_scale<ATYPE>()) {
+                alv[ct][0] = Adl[gg][c + 0];
+                alv[ct][1] = Adl[gg][c + 1];
+            }
         }
 
         int   af[GK_CU_MMAQ_WMT][4];
         float ws[GK_CU_MMAQ_WMT][2];
         float wo[GK_CU_MMAQ_WMT][2];
+        float wsh[GK_CU_MMAQ_WMT][2];
+        float woh[GK_CU_MMAQ_WMT][2];
 
 #pragma unroll
         for (int wt = 0; wt < GK_CU_MMAQ_WMT; ++wt) {
             const int r_lo = warp_m * GK_CU_MMAQ_WM + wt * 16 + group;
 
-            af[wt][0] = As[r_lo    ][tig];
-            af[wt][1] = As[r_lo + 8][tig];
-            af[wt][2] = As[r_lo    ][4 + tig];
-            af[wt][3] = As[r_lo + 8][4 + tig];
+            af[wt][0] = As[gg][r_lo    ][tig];
+            af[wt][1] = As[gg][r_lo + 8][tig];
+            af[wt][2] = As[gg][r_lo    ][4 + tig];
+            af[wt][3] = As[gg][r_lo + 8][4 + tig];
 
-            ws[wt][0] = Wsc[r_lo    ];
-            ws[wt][1] = Wsc[r_lo + 8];
-            wo[wt][0] = Wof[r_lo    ];
-            wo[wt][1] = Wof[r_lo + 8];
+            ws[wt][0] = Wsc[gg][0][r_lo    ];
+            ws[wt][1] = Wsc[gg][0][r_lo + 8];
+            wo[wt][0] = Wof[gg][0][r_lo    ];
+            wo[wt][1] = Wof[gg][0][r_lo + 8];
+            if (gk_cu_has_split_scale<ATYPE>()) {
+                wsh[wt][0] = Wsc[gg][HI][r_lo    ];
+                wsh[wt][1] = Wsc[gg][HI][r_lo + 8];
+                woh[wt][0] = Wof[gg][HI][r_lo    ];
+                woh[wt][1] = Wof[gg][HI][r_lo + 8];
+            }
         }
 
 #pragma unroll
@@ -2840,20 +2887,44 @@ void gk_cu_k_mul_mat_mma_q8(gk_tview a, gk_tview_mut d,
             const int c = warp_n * GK_CU_MMAQ_WN + ct * 8 + group;
 
             int bf[2];
-            bf[0] = Bs[c][tig];
-            bf[1] = Bs[c][4 + tig];
+            bf[0] = Bs[gg][c][tig];
+            bf[1] = Bs[gg][c][4 + tig];
 
 #pragma unroll
             for (int wt = 0; wt < GK_CU_MMAQ_WMT; ++wt) {
-                int df[4] = { 0, 0, 0, 0 };
+                if (gk_cu_has_split_scale<ATYPE>()) {
+                    // The scale changes at element sixteen, so the group is
+                    // two k16 windows drained where it changes - the narrow
+                    // tile's identity, at this tile's width.
+                    const int af_lo[2] = { af[wt][0], af[wt][1] };
+                    const int af_hi[2] = { af[wt][2], af[wt][3] };
 
-                gk_cu_mma_s8_k32(df, af[wt], bf);
+                    int df0[4] = { 0, 0, 0, 0 };
+                    int df1[4] = { 0, 0, 0, 0 };
+                    gk_cu_mma_s8(df0, af_lo, bf[0]);
+                    gk_cu_mma_s8(df1, af_hi, bf[1]);
 
-                acc[wt][ct][0] += ws[wt][0] * adv[ct][0] * (float) df[0] + wo[wt][0] * asv[ct][0];
-                acc[wt][ct][1] += ws[wt][0] * adv[ct][1] * (float) df[1] + wo[wt][0] * asv[ct][1];
-                acc[wt][ct][2] += ws[wt][1] * adv[ct][0] * (float) df[2] + wo[wt][1] * asv[ct][0];
-                acc[wt][ct][3] += ws[wt][1] * adv[ct][1] * (float) df[3] + wo[wt][1] * asv[ct][1];
+#pragma unroll
+                    for (int i = 0; i < 4; ++i) {
+                        const int rh = i >> 1;      // row half of the mma tile
+                        const int ch = i & 1;       // which of the lane's columns
+                        acc[wt][ct][i] += adv[ct][ch] * (ws[wt][rh]  * (float) df0[i]
+                                                       + wsh[wt][rh] * (float) df1[i])
+                                        + wo[wt][rh]  * alv[ct][ch]
+                                        + woh[wt][rh] * (asv[ct][ch] - alv[ct][ch]);
+                    }
+                } else {
+                    int df[4] = { 0, 0, 0, 0 };
+
+                    gk_cu_mma_s8_k32(df, af[wt], bf);
+
+                    acc[wt][ct][0] += ws[wt][0] * adv[ct][0] * (float) df[0] + wo[wt][0] * asv[ct][0];
+                    acc[wt][ct][1] += ws[wt][0] * adv[ct][1] * (float) df[1] + wo[wt][0] * asv[ct][1];
+                    acc[wt][ct][2] += ws[wt][1] * adv[ct][0] * (float) df[2] + wo[wt][1] * asv[ct][0];
+                    acc[wt][ct][3] += ws[wt][1] * adv[ct][1] * (float) df[3] + wo[wt][1] * asv[ct][1];
+                }
             }
+        }
         }
 
         __syncthreads();
@@ -2897,14 +2968,15 @@ void gk_cu_k_mul_mat_mma_q8(gk_tview a, gk_tview_mut d,
 // the same combine pass, because a projection matrix is short of rows in
 // exactly the way that tile's UNet shapes are.
 //
-// The split-scale formats are admitted here, unlike the 128x128 tile above:
-// a verify's dominant weights are whatever format the model shipped in, and
-// q2_K excluded is most of a q2_K model excluded. Their group is two
-// `m16n8k16` windows drained separately - the accumulator has to be emptied
-// where the scale changes - against the whole-group formats' one k32 window.
-// The activation block's `sl` is what makes the second drain's offset term
-// affordable: the low half's code sum is precomputed, so the high half's is
-// one subtract.
+// The split-scale formats are admitted here, as everywhere on the integer
+// tensor-core paths: a verify's dominant weights are whatever format the
+// model shipped in, and q2_K excluded is most of a q2_K model excluded.
+// Their group is two `m16n8k16` windows drained separately - the accumulator
+// has to be emptied where the scale changes - against the whole-group
+// formats' one k32 window. The activation block's `sl` is what makes the
+// second drain's offset term affordable: the low half's code sum is
+// precomputed, so the high half's is one subtract. The 128x128 tile above
+// runs the same two-window identity for these formats.
 // --------------------------------------------------------------------------
 
 #define GK_CU_MMAN_TILE_M  128   // rows a block owns; a warp owns 16
@@ -3620,12 +3692,16 @@ void gk_cuda_mul_mat(gkStream_t stream, struct gk_cuda_scratch * scratch,
                                        GK_CUDA_BLOCK, 0, stream>>>(
                     gk_cu_view(src1), aq, n_grp, n_cols, n_blk);
 
-                // `mma.sync...k32` accumulates a whole group in one
-                // instruction, so a scale that changes halfway through it has
-                // nowhere to be applied. Those formats take the dp4a tile
-                // below, which drains twice.
+                // A whole-group format runs one `mma.sync...k32` per group; a
+                // split-scale format runs the group as two k16 windows
+                // drained where the scale changes, exactly as the narrow tile
+                // does. Both live in the same kernel, so every integer-path
+                // format takes the tensor cores when the device has them.
+                // `GK_MM_MMA_SPLIT=0` puts the split-scale formats back on
+                // the dp4a tile - a bisect lever, not a setting.
                 if (gk_cuda_mm_mma_q8_available(scratch) &&
-                    !gk_cuda_mm_split_scale((int) src0->type)) {
+                    (!gk_cuda_mm_split_scale((int) src0->type) ||
+                     gk_cu_env_int("GK_MM_MMA_SPLIT", 1) != 0)) {
                     dim3 mgrid;
                     mgrid.x = (unsigned) ((dst->ne[0] + GK_CU_MMAQ_TILE_M - 1) / GK_CU_MMAQ_TILE_M);
                     mgrid.y = (unsigned) ((n_cols     + GK_CU_MMAQ_TILE_N - 1) / GK_CU_MMAQ_TILE_N);
