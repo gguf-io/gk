@@ -760,6 +760,7 @@ static inline enum gk_status gk_cuda_launch_one(struct gk_cuda_backend_ctx * ctx
 #define GK_CU_FUSE_MADDS       7 // at the second add: c + y*g + t
 #define GK_CU_FUSE_UNARYMUL    8 // at the mul: unary(x) * y
 #define GK_CU_FUSE_ROPE2       9 // at the add: x1*f1 + x2*f2, repeats elided
+#define GK_CU_FUSE_MMACT      10 // at the unary: applied in the matmul epilogue
 
 static bool gk_cu_fuse_on(void) {
     static int on = -1;
@@ -821,7 +822,8 @@ static bool gk_cu_fuse_same_ne(const struct gk_tensor * a, const struct gk_tenso
            a->ne[2] == b->ne[2] && a->ne[3] == b->ne[3];
 }
 
-static void gk_cu_fuse_plan(struct gk_cgraph * graph, int n, std::vector<uint8_t> & tag,
+static void gk_cu_fuse_plan(struct gk_cuda_scratch * scratch,
+                            struct gk_cgraph * graph, int n, std::vector<uint8_t> & tag,
                             std::vector<int32_t> & aux) {
     tag.assign((size_t) n, GK_CU_FUSE_NONE);
     aux.assign((size_t) n * 2, -1);
@@ -1055,6 +1057,29 @@ static void gk_cu_fuse_plan(struct gk_cgraph * graph, int n, std::vector<uint8_t
             }
         }
 
+        // unary directly on a gate projection: applied in the matmul's own
+        // epilogue, so the 68 MB activation pass never runs. This is the
+        // geglu pair the unary*mul fusion cannot reach - the allocator
+        // recycles the gate projection under it - approached from the other
+        // side: nothing here outlives the matmul launch.
+        if (h->op == GK_OP_UNARY && h->src[0] != NULL &&
+            h->src[0]->op == GK_OP_MUL_MAT) {
+            struct gk_tensor * m = h->src[0];
+
+            int mi3 = -1;
+            if (clean(m, &mi3) && uses[m] == 1 &&
+                gk_cu_fuse_same_ne(h, m) &&
+                (int) h->type == GK_TYPE_F32 && gk_is_contiguous(h) &&
+                (int) m->type == GK_TYPE_F32 && gk_is_contiguous(m) &&
+                gk_cuda_mm_act_fusable(scratch, m) &&
+                window_ok(mi3, i, { m->src[1] }, { m }, {})) {
+                tag[(size_t) mi3] = GK_CU_FUSE_SKIP;
+                tag[(size_t) i]   = GK_CU_FUSE_MMACT;
+                aux[(size_t) i * 2] = mi3;
+            }
+            continue;
+        }
+
         if (h->op == GK_OP_ADD && h->src[0] != NULL && h->src[1] != NULL) {
             // The hand-built rope pair: add(mul(repeat(x1), f1),
             // mul(repeat(x2), f2)), where each x is [1,K,T,H], each f
@@ -1194,17 +1219,17 @@ static void gk_cu_fuse_plan(struct gk_cgraph * graph, int n, std::vector<uint8_t
         static std::unordered_map<int, bool> seen;
         if (!seen[n]) {
             seen[n] = true;
-            int cnt[10] = { 0 };
+            int cnt[11] = { 0 };
             for (int i = 0; i < n; ++i) {
                 cnt[tag[(size_t) i]]++;
             }
             gk_logf("gk cuda fuse plan (%d nodes): head %d head3 %d rmsmul_t %d "
-                    "addrmsmul_t %d madd %d madds %d unarymul %d rope2 %d skip %d\n",
+                    "addrmsmul_t %d madd %d madds %d unarymul %d rope2 %d mmact %d skip %d\n",
                     n, cnt[GK_CU_FUSE_HEAD], cnt[GK_CU_FUSE_HEAD3],
                     cnt[GK_CU_FUSE_RMSMUL_T], cnt[GK_CU_FUSE_ADDRMSMUL_T],
                     cnt[GK_CU_FUSE_MADD], cnt[GK_CU_FUSE_MADDS],
                     cnt[GK_CU_FUSE_UNARYMUL], cnt[GK_CU_FUSE_ROPE2],
-                    cnt[GK_CU_FUSE_SKIP]);
+                    cnt[GK_CU_FUSE_MMACT], cnt[GK_CU_FUSE_SKIP]);
         }
     }
 }
@@ -1258,6 +1283,10 @@ static inline int gk_cu_launch_planned(struct gk_cuda_backend_ctx * ctx,
                 break;
             case GK_CU_FUSE_ROPE2:
                 gk_cuda_fused_rope_pair(ctx->stream, h->src[0], h->src[1], h);
+                break;
+            case GK_CU_FUSE_MMACT:
+                gk_cuda_mul_mat_act(ctx->stream, &ctx->scratch,
+                                    gk_graph_node(graph, a0), h);
                 break;
             default:
                 break;
@@ -1323,7 +1352,7 @@ static enum gk_status gk_cuda_launch_nodes(struct gk_cuda_backend_ctx * ctx,
                                            struct gk_cgraph * graph, int n) {
     std::vector<uint8_t> tag;
     std::vector<int32_t> aux;
-    gk_cu_fuse_plan(graph, n, tag, aux);
+    gk_cu_fuse_plan(&ctx->scratch, graph, n, tag, aux);
     gk_cu_graph_dump(graph, n);
 
     int i = 0;
@@ -1372,7 +1401,7 @@ static enum gk_status gk_cuda_launch_nodes_bucketed(struct gk_cuda_backend_ctx *
                                                     struct gk_cu_graph_entry * ge, int bucket) {
     std::vector<uint8_t> tag;
     std::vector<int32_t> aux;
-    gk_cu_fuse_plan(graph, n, tag, aux);
+    gk_cu_fuse_plan(&ctx->scratch, graph, n, tag, aux);
 
     GK_CUDA_CHECK(gk_cu_event_record_ext(ge->pev[0], ctx->stream));
     int i = 0;

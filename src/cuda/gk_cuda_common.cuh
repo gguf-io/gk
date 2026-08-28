@@ -378,6 +378,7 @@ struct gk_cuda_scratch {
     const void * aq_tensor;  // src1 itself, which the allocator does not recycle
     int64_t      aq_blk;
     int64_t      aq_grp;
+    int64_t      aq_planes;  // whether the transposed scalar planes rode along
     uint64_t     aq_pass;
     uint64_t     pass;   // bumped by the backend at every graph_compute
 };

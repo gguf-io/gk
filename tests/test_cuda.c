@@ -1119,6 +1119,13 @@ static struct gk_tensor * build_mmq_q2_K(struct gk_ctx * ctx, struct gk_tensor *
     return mmq_case(ctx, in, n_in, GK_TYPE_Q2_K, 512, 700, 70);
 }
 
+// The same tile at its tall (256-row) shape: the dispatch takes it above
+// 4096 rows, and the 700-row case above never reaches it. Rows off the 256
+// boundary so the tall guard runs.
+static struct gk_tensor * build_mmq_q2_K_tall(struct gk_ctx * ctx, struct gk_tensor ** in, int * n_in) {
+    return mmq_case(ctx, in, n_in, GK_TYPE_Q2_K, 512, 4200, 70);
+}
+
 // One super-block of k, so the group-to-super-block indexing never crosses a
 // boundary; if this agrees and the wider one drifts, the drift is accumulation.
 static struct gk_tensor * build_mmv_q6_K_1sb(struct gk_ctx * ctx, struct gk_tensor ** in, int * n_in) {
@@ -2626,6 +2633,7 @@ int main(void) {
     // bound; what it checks is the wide tile's two-window drain, whose
     // exactness against the dp4a tile GK_MM_MMA_SPLIT=0 can bisect.
     failures += run_op_tol(gpu, "mmq q2_K",      build_mmq_q2_K,     2e-1f);
+    failures += run_op_tol(gpu, "mmq q2_K tall", build_mmq_q2_K_tall, 2e-1f);
 
     // The deep mmq bounds are looser than the shallow ones: at k = 6656 the
     // CPU reference's per-256 activation scales cost ~0.1 relative on outputs
