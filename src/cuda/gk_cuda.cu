@@ -797,6 +797,18 @@ static bool gk_cu_fuse_tail_on(void) {
     return on != 0;
 }
 
+// GK_CUDA_FUSE_MASK: bisect aid - a bitmask of patterns allowed to fire,
+// bit k = pattern k (e.g. 0x200 = rope2 only, 0x5ff = all but rope2).
+// Unset allows everything.
+static bool gk_cu_fuse_pat_on(int pat) {
+    static long mask = -1;
+    if (mask < 0) {
+        const char * e = getenv("GK_CUDA_FUSE_MASK");
+        mask = e != NULL ? strtol(e, NULL, 0) : 0x7ff;
+    }
+    return (mask & (1l << pat)) != 0;
+}
+
 // Whether this node's launch writes its output at all: the view family does
 // not, and treating a view as a writer would veto every window it sits in.
 static bool gk_cu_fuse_writes(const struct gk_tensor * t) {
@@ -820,6 +832,42 @@ static bool gk_cu_fuse_overlap(const struct gk_tensor * a, const struct gk_tenso
 static bool gk_cu_fuse_same_ne(const struct gk_tensor * a, const struct gk_tensor * b) {
     return a->ne[0] == b->ne[0] && a->ne[1] == b->ne[1] &&
            a->ne[2] == b->ne[2] && a->ne[3] == b->ne[3];
+}
+
+// A fused head reads its parts' sources at its own position while writing
+// its output. The allocator considers a part's source dead at the part, so
+// the output may have been given (part of) that very storage: unfused that
+// was fine - the part's read ran before the head's write - fused it is a
+// cross-thread race inside one kernel, and the corruption varies with warp
+// timing. Writing straight onto a read is safe only when every thread
+// writes exactly the element it read: same address, same extents, same
+// type. A broadcast row never satisfies that against a full-size output,
+// and any partial overlap is a race.
+static bool gk_cu_fuse_out_ok(const struct gk_tensor * out,
+                              std::initializer_list<const struct gk_tensor *> reads) {
+    for (const struct gk_tensor * r : reads) {
+        if (r == NULL || !gk_cu_fuse_overlap(out, r)) {
+            continue;
+        }
+        if (r->data == out->data && r->type == out->type &&
+            gk_cu_fuse_same_ne(r, out)) {
+            continue; // exact elementwise aliasing: in-thread read-before-write
+        }
+        return false;
+    }
+    return true;
+}
+
+// The strict flavor, for heads whose read pattern is not elementwise (a
+// matmul's tiles, rope's pair layout): any overlap at all is a race.
+static bool gk_cu_fuse_out_disjoint(const struct gk_tensor * out,
+                                    std::initializer_list<const struct gk_tensor *> reads) {
+    for (const struct gk_tensor * r : reads) {
+        if (r != NULL && gk_cu_fuse_overlap(out, r)) {
+            return false;
+        }
+    }
+    return true;
 }
 
 static void gk_cu_fuse_plan(struct gk_cuda_scratch * scratch,
@@ -865,14 +913,17 @@ static void gk_cu_fuse_plan(struct gk_cuda_scratch * scratch,
                 a->src[1]->ne[0] == a->ne[0] && a->src[1]->ne[1] == a->ne[1] &&
                 a->src[1]->ne[2] == a->ne[2] && a->src[1]->ne[3] == a->ne[3];
 
+            const struct gk_tensor * w3 = c->src[0] == b ? c->src[1] : c->src[0];
             if (c->op == GK_OP_MUL && (c->src[0] == b || c->src[1] == b) &&
                 uses[b] == 1 &&
                 (b->flags & (GK_TENSOR_FLAG_OUTPUT | GK_TENSOR_FLAG_INPUT)) == 0 &&
                 same_abc && add_elementwise &&
                 gk_cu_fuse_flat(a) && gk_cu_fuse_flat(c) &&
                 gk_cu_fuse_flat(a->src[0]) && gk_cu_fuse_flat(a->src[1]) &&
-                gk_cu_fuse_weight(c->src[0] == b ? c->src[1] : c->src[0], c->ne[0]) &&
-                (int) b->type == GK_TYPE_F32) {
+                gk_cu_fuse_weight(w3, c->ne[0]) &&
+                (int) b->type == GK_TYPE_F32 && gk_cu_fuse_pat_on(GK_CU_FUSE_HEAD3) &&
+                gk_cu_fuse_out_ok(c, { a->src[0], a->src[1], w3, a }) &&
+                gk_cu_fuse_out_ok(a, { a->src[0], a->src[1], w3 })) {
                 tag[(size_t) i]     = GK_CU_FUSE_HEAD3;
                 tag[(size_t) i + 1] = GK_CU_FUSE_SKIP;
                 tag[(size_t) i + 2] = GK_CU_FUSE_SKIP;
@@ -900,6 +951,11 @@ static void gk_cu_fuse_plan(struct gk_cuda_scratch * scratch,
         if ((int) a->type != GK_TYPE_F32 ||
             !gk_cu_fuse_flat(b) || !gk_cu_fuse_flat(a->src[0]) ||
             !gk_cu_fuse_weight(b->src[0] == a ? b->src[1] : b->src[0], b->ne[0])) {
+            continue;
+        }
+        if (!gk_cu_fuse_pat_on(GK_CU_FUSE_HEAD) ||
+            !gk_cu_fuse_out_ok(b, { a->src[0],
+                                    b->src[0] == a ? b->src[1] : b->src[0] })) {
             continue;
         }
 
@@ -1015,7 +1071,10 @@ static void gk_cu_fuse_plan(struct gk_cuda_scratch * scratch,
                             gk_cu_fuse_same_ne(ad, ad->src[1]) &&
                             gk_cu_fuse_same_ne(ad, h);
                         if (ew && gk_cu_fuse_flat(ad) &&
+                            gk_cu_fuse_pat_on(GK_CU_FUSE_ADDRMSMUL_T) &&
                             gk_cu_fuse_flat(ad->src[0]) && gk_cu_fuse_flat(ad->src[1]) &&
+                            gk_cu_fuse_out_ok(h, { ad->src[0], ad->src[1], w, ad }) &&
+                            gk_cu_fuse_out_ok(ad, { ad->src[0], ad->src[1], w }) &&
                             window_ok(ai, i, { ad->src[0], ad->src[1], w },
                                       { ad, nm }, { ni })) {
                             tag[(size_t) ai] = GK_CU_FUSE_SKIP;
@@ -1027,7 +1086,9 @@ static void gk_cu_fuse_plan(struct gk_cuda_scratch * scratch,
                         }
                     }
                 }
-                if (!done && window_ok(ni, i, { nm->src[0], w }, { nm }, {})) {
+                if (!done && gk_cu_fuse_pat_on(GK_CU_FUSE_RMSMUL_T) &&
+                    gk_cu_fuse_out_ok(h, { nm->src[0], w }) &&
+                    window_ok(ni, i, { nm->src[0], w }, { nm }, {})) {
                     tag[(size_t) ni] = GK_CU_FUSE_SKIP;
                     tag[(size_t) i]  = GK_CU_FUSE_RMSMUL_T;
                     aux[(size_t) i * 2] = ni;
@@ -1048,7 +1109,9 @@ static void gk_cu_fuse_plan(struct gk_cuda_scratch * scratch,
                 gk_cu_fuse_flat(h) && gk_cu_fuse_flat(u->src[0]) &&
                 gk_cu_fuse_flat(h->src[0] == u ? h->src[1] : h->src[0])) {
                 const struct gk_tensor * y = h->src[0] == u ? h->src[1] : h->src[0];
-                if (window_ok(ui, i, { u->src[0], y }, { u }, {})) {
+                if (gk_cu_fuse_pat_on(GK_CU_FUSE_UNARYMUL) &&
+                    gk_cu_fuse_out_ok(h, { u->src[0], y }) &&
+                    window_ok(ui, i, { u->src[0], y }, { u }, {})) {
                     tag[(size_t) ui] = GK_CU_FUSE_SKIP;
                     tag[(size_t) i]  = GK_CU_FUSE_UNARYMUL;
                     aux[(size_t) i * 2] = ui;
@@ -1072,6 +1135,8 @@ static void gk_cu_fuse_plan(struct gk_cuda_scratch * scratch,
                 (int) h->type == GK_TYPE_F32 && gk_is_contiguous(h) &&
                 (int) m->type == GK_TYPE_F32 && gk_is_contiguous(m) &&
                 gk_cuda_mm_act_fusable(scratch, m) &&
+                gk_cu_fuse_pat_on(GK_CU_FUSE_MMACT) &&
+                gk_cu_fuse_out_disjoint(h, { m->src[0], m->src[1] }) &&
                 window_ok(mi3, i, { m->src[1] }, { m }, {})) {
                 tag[(size_t) mi3] = GK_CU_FUSE_SKIP;
                 tag[(size_t) i]   = GK_CU_FUSE_MMACT;
@@ -1124,7 +1189,9 @@ static void gk_cu_fuse_plan(struct gk_cuda_scratch * scratch,
                     const struct gk_tensor * r2 = m2->src[0]->op == GK_OP_REPEAT
                                                 ? m2->src[0] : m2->src[1];
                     const int from = ri[0] < ri[1] ? ri[0] : ri[1];
-                    if (window_ok(from, i, { r1->src[0], r2->src[0], f1, f2 }, {},
+                    if (gk_cu_fuse_pat_on(GK_CU_FUSE_ROPE2) &&
+                        gk_cu_fuse_out_disjoint(h, { r1->src[0], r2->src[0], f1, f2 }) &&
+                        window_ok(from, i, { r1->src[0], r2->src[0], f1, f2 }, {},
                                   { ri[0], ri[1], mi[0], mi[1] })) {
                         tag[(size_t) ri[0]] = GK_CU_FUSE_SKIP;
                         tag[(size_t) ri[1]] = GK_CU_FUSE_SKIP;
@@ -1184,7 +1251,9 @@ static void gk_cu_fuse_plan(struct gk_cuda_scratch * scratch,
                         if (!gk_cu_fuse_weight(t, h->ne[0])) {
                             break;
                         }
-                        if (window_ok(mi2, j, { c, y, g, t }, { h }, { i })) {
+                        if (gk_cu_fuse_pat_on(GK_CU_FUSE_MADDS) &&
+                            gk_cu_fuse_out_ok(h2, { c, y, g, t }) &&
+                            window_ok(mi2, j, { c, y, g, t }, { h }, { i })) {
                             tag[(size_t) mi2] = GK_CU_FUSE_SKIP;
                             tag[(size_t) i]   = GK_CU_FUSE_SKIP;
                             tag[(size_t) j]   = GK_CU_FUSE_MADDS;
@@ -1198,7 +1267,9 @@ static void gk_cu_fuse_plan(struct gk_cuda_scratch * scratch,
                     }
                 }
 
-                if (window_ok(mi2, i, { c, y, g }, {}, {})) {
+                if (gk_cu_fuse_pat_on(GK_CU_FUSE_MADD) &&
+                    gk_cu_fuse_out_ok(h, { c, y, g }) &&
+                    window_ok(mi2, i, { c, y, g }, {}, {})) {
                     tag[(size_t) mi2] = GK_CU_FUSE_SKIP;
                     tag[(size_t) i]   = GK_CU_FUSE_MADD;
                     aux[(size_t) i * 2] = mi2;
