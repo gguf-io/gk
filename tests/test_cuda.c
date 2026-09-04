@@ -1574,6 +1574,22 @@ static struct gk_tensor * build_get_rows_i32(struct gk_ctx * ctx, struct gk_tens
     return gk_get_rows(ctx, in[0], in[1]);
 }
 
+// An embedding table stored as plain integers (a weight the loader did not
+// widen, or a raw table): gathered rows come out as f32.
+static struct gk_tensor * build_get_rows_i8(struct gk_ctx * ctx, struct gk_tensor ** in, int * n_in) {
+    in[0] = gk_new_tensor_2d(ctx, GK_TYPE_I8, 96, 40);
+    in[1] = gk_new_tensor_1d(ctx, GK_TYPE_I32, 13);
+    *n_in = 2;
+    return gk_get_rows(ctx, in[0], in[1]);
+}
+
+static struct gk_tensor * build_get_rows_i16(struct gk_ctx * ctx, struct gk_tensor ** in, int * n_in) {
+    in[0] = gk_new_tensor_2d(ctx, GK_TYPE_I16, 96, 40);
+    in[1] = gk_new_tensor_1d(ctx, GK_TYPE_I32, 13);
+    *n_in = 2;
+    return gk_get_rows(ctx, in[0], in[1]);
+}
+
 static struct gk_tensor * build_cast_i32(struct gk_ctx * ctx, struct gk_tensor ** in, int * n_in) {
     in[0] = gk_new_tensor_1d(ctx, GK_TYPE_F32, 1000);
     *n_in = 1;
@@ -1803,6 +1819,16 @@ static int run_op_tol(gk_backend_t gpu, const char * name, op_builder build, flo
             // sequence ids, which have to be valid rows of the state cache.
             for (int64_t j = 0; j < n; ++j) {
                 ((int32_t *) values)[j] = (int32_t) j;
+            }
+        } else if (cpu_in[i]->type == GK_TYPE_I8 || cpu_in[i]->type == GK_TYPE_I16) {
+            // A narrow integer table: the float fill would round to zeros, so
+            // walk the type's range instead.
+            for (int64_t j = 0; j < n; ++j) {
+                if (cpu_in[i]->type == GK_TYPE_I8) {
+                    ((int8_t *) values)[j] = (int8_t) ((j * 37) % 255 - 127);
+                } else {
+                    ((int16_t *) values)[j] = (int16_t) ((j * 9973) % 65535 - 32767);
+                }
             }
         } else {
             float * f = (float *) malloc((size_t) (n > 0 ? n : 1) * sizeof(float));
@@ -2742,6 +2768,8 @@ int main(void) {
     failures += run_op(gpu, "rope",           build_rope);
     failures += run_op(gpu, "get_rows",       build_get_rows);
     failures += run_op(gpu, "get_rows i32",   build_get_rows_i32);
+    failures += run_op(gpu, "get_rows i8",    build_get_rows_i8);
+    failures += run_op(gpu, "get_rows i16",   build_get_rows_i16);
     failures += run_op(gpu, "cast f32->i32",  build_cast_i32);
     // The sum reduces a few thousand signed values into one scalar in float
     // against the CPU's double, so it is held to an absolute rather than an

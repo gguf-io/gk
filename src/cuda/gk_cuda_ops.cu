@@ -3395,6 +3395,11 @@ static bool gk_cu_readable(const struct gk_tensor * t) {
     if (gk_cu_is_float_type(type) || type == GKT_I32 || type == GKT_I64) {
         return true;
     }
+    // the narrow integers are read through gk_cu_row_elem like a quantized
+    // row, so like one they have to be packed
+    if (type == GKT_I8 || type == GKT_I16) {
+        return t->nb[0] == (size_t) gk_cu_type_size(type);
+    }
     // a quantized operand is only readable where it is packed, which is what
     // gk_cu_row_elem assumes
     return gk_cu_type_supported(type) && t->nb[0] == (size_t) gk_cu_type_size(type);
