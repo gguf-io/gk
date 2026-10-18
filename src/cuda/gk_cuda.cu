@@ -26,6 +26,7 @@
 
 #include <stdlib.h>
 #include <string.h>
+#include <mutex>
 
 #include <algorithm>
 #include <chrono>
@@ -101,11 +102,91 @@ static void * gk_cuda_buffer_get_base(gk_backend_buffer_t buffer) {
     return ((struct gk_cuda_buffer_ctx *) buffer->context)->base;
 }
 
+// --------------------------------------------------------------------------
+// Large host-to-device copies, staged through pinned memory.
+//
+// A cudaMemcpy from pageable memory runs at 1.5 GB/s here: the driver walks
+// the pages through its own small pinned bounce buffer, serially. A 24.6 GB
+// text encoder staged under --offload-to-cpu took 16 s of that. Two pinned
+// chunks and a stream give the overlap the driver does not: memcpy into one
+// chunk while the DMA engine drains the other, which runs at the memcpy's
+// pace (6-10 GB/s). The source is fully consumed by the memcpys before this
+// returns, so the caller's "may free `data` on return" contract holds; the
+// chunk a later call reuses waits on the event its last DMA recorded.
+// Copies under the threshold take the plain path, and so does everything if
+// the pinned allocation is refused.
+// --------------------------------------------------------------------------
+#define GK_CU_H2D_STAGE_MIN   ((size_t) 4u << 20)
+#define GK_CU_H2D_STAGE_CHUNK ((size_t) 64u << 20)
+
+static bool gk_cu_h2d_staged(void * dst, const void * src, size_t size, gkStream_t stream) {
+    static std::mutex  mtx;
+    static void *      pin[2]     = { NULL, NULL };
+    static gkEvent_t   ev[2];
+    static bool        pending[2] = { false, false };
+    static int         state      = 0;   // 0 untried, 1 ready, -1 refused
+
+    // Opt-in (GK_CUDA_H2D_STAGE=1): measured on the 5090 box the pipeline
+    // and the pageable copy both run at the link's 1.5 GB/s (a PCIe-limited
+    // slot), and the per-call stream sync costs 8% on 32 MB tensors there. It
+    // pays where the pageable path, not the link, is the limit.
+    static const char * env = getenv("GK_CUDA_H2D_STAGE");
+    if (env == NULL || env[0] != '1') {
+        return false;
+    }
+
+    std::lock_guard<std::mutex> lock(mtx);
+    if (state == 0) {
+        state = 1;
+        for (int b = 0; b < 2; ++b) {
+            if (gkHostAlloc(&pin[b], GK_CU_H2D_STAGE_CHUNK) != gkSuccess ||
+                gkEventCreate(&ev[b]) != gkSuccess) {
+                state = -1;
+                break;
+            }
+        }
+        if (state == -1) {
+            for (int b = 0; b < 2; ++b) {
+                if (pin[b] != NULL) { gkFreeHost(pin[b]); pin[b] = NULL; }
+            }
+            (void) gkGetLastError();
+            gk_logf("gk cuda: pinned staging for host-to-device copies refused, using pageable copies\n");
+        } else if (getenv("GK_CUDA_H2D_LOG") != NULL) {
+            gk_logf("gk cuda: pinned staging for host-to-device copies on (2 x %zu MB)\n",
+                    (size_t) (GK_CU_H2D_STAGE_CHUNK >> 20));
+        }
+    }
+    if (state != 1) {
+        return false;
+    }
+
+    size_t off = 0;
+    int    b   = 0;
+    while (off < size) {
+        const size_t n = size - off < GK_CU_H2D_STAGE_CHUNK ? size - off : GK_CU_H2D_STAGE_CHUNK;
+        if (pending[b]) {
+            GK_CUDA_CHECK(gkEventSynchronize(ev[b]));
+        }
+        memcpy(pin[b], (const char *) src + off, n);
+        GK_CUDA_CHECK(gkMemcpyAsync((char *) dst + off, pin[b], n, gkMemcpyHostToDevice, stream));
+        GK_CUDA_CHECK(gkEventRecord(ev[b], stream));
+        pending[b] = true;
+        off += n;
+        b ^= 1;
+    }
+    return true;
+}
+
 static void gk_cuda_buffer_set_tensor(gk_backend_buffer_t buffer, struct gk_tensor * tensor,
                                       const void * data, size_t offset, size_t size) {
     struct gk_cuda_buffer_ctx * ctx = (struct gk_cuda_buffer_ctx *) buffer->context;
 
     GK_CUDA_CHECK(gkSetDevice(ctx->device));
+    if (size >= GK_CU_H2D_STAGE_MIN &&
+        gk_cu_h2d_staged((char *) tensor->data + offset, data, size, gkStreamPerThread)) {
+        GK_CUDA_CHECK(gkStreamSynchronize(gkStreamPerThread));
+        return;
+    }
     // Synchronous by contract: the caller may free `data` the moment this
     // returns, so the copy cannot be left in flight.
     //
@@ -162,6 +243,14 @@ static bool gk_cuda_buffer_cpy_tensor(gk_backend_buffer_t buffer, const struct g
     // one is a host-to-device copy rather than a staged round trip.
     if (gk_backend_buft_is_host(src_buft)) {
         GK_CUDA_CHECK(gkSetDevice(dctx->device));
+        // The model manager stages every offloaded weight through here, so
+        // this is where the pinned pipeline above pays: 1.5 GB/s pageable
+        // against the memcpy's pace.
+        if (gk_nbytes(src) >= GK_CU_H2D_STAGE_MIN &&
+            gk_cu_h2d_staged(dst->data, src->data, gk_nbytes(src), gkStreamPerThread)) {
+            GK_CUDA_CHECK(gkStreamSynchronize(gkStreamPerThread));
+            return true;
+        }
         GK_CUDA_CHECK(gkMemcpy(dst->data, src->data, gk_nbytes(src), gkMemcpyHostToDevice));
         return true;
     }

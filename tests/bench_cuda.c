@@ -1005,6 +1005,10 @@ static struct gk_tensor * b_ltx_q5k_up  (struct gk_ctx * c) { return mul_mat_cas
 static struct gk_tensor * b_ltx_q5k_down(struct gk_ctx * c) { return mul_mat_case(c, GK_TYPE_Q5_K, 16384,  4096, 8464); }
 static struct gk_tensor * b_ltx_q40_attn(struct gk_ctx * c) { return mul_mat_case(c, GK_TYPE_Q4_0,  4096,  4096, 8464); }
 static struct gk_tensor * b_ltx_q4k_attn(struct gk_ctx * c) { return mul_mat_case(c, GK_TYPE_Q4_K,  4096,  4096, 8464); }
+static struct gk_tensor * b_ltx_q6k_attn(struct gk_ctx * c) { return mul_mat_case(c, GK_TYPE_Q6_K,  4096,  4096, 8464); }
+static struct gk_tensor * b_ltx_q3k_attn(struct gk_ctx * c) { return mul_mat_case(c, GK_TYPE_Q3_K,  4096,  4096, 8464); }
+// the Gemma 4 text encoder's gate/up at the 1024-token prompt, bf16 weights
+static struct gk_tensor * b_ltx_te_bf16 (struct gk_ctx * c) { return mul_mat_case(c, GK_TYPE_BF16,  3840, 15360, 1024); }
 
 static const struct bench_case g_cases[] = {
     { "matmul (decode, 1 column)", "attn_q      q4_0", "1536x2048",       b_mm_q_dec,     ARENA_SMALL },
@@ -1129,6 +1133,9 @@ static const struct bench_case g_cases[] = {
     { NULL,            "ffn down  q5_K",  "16384x4096 n=8464",  b_ltx_q5k_down, ARENA_HUGE },
     { NULL,            "attn      q4_K",  "4096x4096 n=8464",   b_ltx_q4k_attn, ARENA_HUGE },
     { NULL,            "attn      q4_0",  "4096x4096 n=8464",   b_ltx_q40_attn, ARENA_HUGE },
+    { NULL,            "attn      q6_K",  "4096x4096 n=8464",   b_ltx_q6k_attn, ARENA_HUGE },
+    { NULL,            "attn      q3_K",  "4096x4096 n=8464",   b_ltx_q3k_attn, ARENA_HUGE },
+    { NULL,            "te gate   bf16",  "3840x15360 n=1024",  b_ltx_te_bf16,  ARENA_HUGE },
 
     { "krea2 DiT matmuls (q2_K, against f16 and q4_K at the same shape)",
                        "ff up     q2_K",  "6144x16384 n=1038",  b_k2_ffup_q2k, ARENA_BIG },

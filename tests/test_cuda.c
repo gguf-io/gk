@@ -18,6 +18,24 @@
 #include <math.h>
 #include <stdio.h>
 #include <stdlib.h>
+#include <string.h>
+#include <time.h>
+#if defined(_WIN32)
+#include <windows.h>
+#endif
+
+static double h2d_now_ms(void) {
+#if defined(_WIN32)
+    LARGE_INTEGER counter, frequency;
+    QueryPerformanceCounter(&counter);
+    QueryPerformanceFrequency(&frequency);
+    return 1000.0 * (double) counter.QuadPart / (double) frequency.QuadPart;
+#else
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return 1000.0 * (double) ts.tv_sec + (double) ts.tv_nsec * 1e-6;
+#endif
+}
 
 static const enum gk_type g_weight_types[] = {
     GK_TYPE_F32, GK_TYPE_F16, GK_TYPE_BF16,
@@ -944,6 +962,23 @@ static struct gk_tensor * build_mmq_q5_K_tiles(struct gk_ctx * ctx, struct gk_te
 
 static struct gk_tensor * build_mmq_q4_K_tiles(struct gk_ctx * ctx, struct gk_tensor ** in, int * n_in) {
     return mmq_case(ctx, in, n_in, GK_TYPE_Q4_K, 1024, 1200, 300);
+}
+
+// The q3_K/q6_K pipeline tile stages two-byte-shifted blocks: k = 768 is
+// three superblocks, so odd superblocks AND odd rows (row stride 330 / 630
+// bytes) start two bytes into a word, and the tile's funnel-shift path runs
+// on both parities.
+static struct gk_tensor * build_mmq_q6_K_tiles(struct gk_ctx * ctx, struct gk_tensor ** in, int * n_in) {
+    return mmq_case(ctx, in, n_in, GK_TYPE_Q6_K, 768, 1200, 300);
+}
+
+static struct gk_tensor * build_mmq_q3_K_tiles(struct gk_ctx * ctx, struct gk_tensor ** in, int * n_in) {
+    return mmq_case(ctx, in, n_in, GK_TYPE_Q3_K, 768, 1200, 300);
+}
+
+// bf16 weights on the f16 tensor-core tile (the staging pass converts them)
+static struct gk_tensor * build_mm_bf16_tile(struct gk_ctx * ctx, struct gk_tensor ** in, int * n_in) {
+    return mmq_case(ctx, in, n_in, GK_TYPE_BF16, 512, 700, 70);
 }
 
 // The integer *mat-vec*, which is a different kernel from the tile above and
@@ -2651,6 +2686,49 @@ static int run_argsort(gk_backend_t gpu, const char * name,
     return bad == 0 ? 0 : 1;
 }
 
+// GK_TEST_H2D=1: time the host-to-device upload the model manager's staging
+// does, whole and in 32 MB tensors, with the pinned pipeline on
+// (default) or off (GK_CUDA_H2D_STAGE=0).
+static int bench_h2d(gk_backend_t gpu) {
+    const size_t bytes = (size_t) 2048u << 20;   // 2 GB
+    struct gk_ctx * ctx = gk_init((struct gk_init_params) {
+        .mem_size = 1u << 20, .mem_buffer = NULL, .no_alloc = true,
+    });
+    struct gk_tensor * whole = gk_new_tensor_1d(ctx, GK_TYPE_F32, (int64_t) (bytes / 4));
+    const int n_parts = 64;
+    struct gk_tensor * parts[64];
+    for (int i = 0; i < n_parts; ++i) {
+        parts[i] = gk_new_tensor_1d(ctx, GK_TYPE_F32, (int64_t) (bytes / 4 / n_parts));
+    }
+    gk_backend_buffer_t buf = gk_backend_buft_alloc_buffer(gk_backend_get_default_buffer_type(gpu), bytes + 4096);
+    if (buf == NULL) { printf("h2d: alloc failed\n"); return 1; }
+    char * base = (char *) gk_backend_buffer_get_base(buf);
+    whole->buffer = buf; whole->data = base;
+    for (int i = 0; i < n_parts; ++i) {
+        parts[i]->buffer = buf;
+        parts[i]->data   = base + (size_t) i * (bytes / n_parts);
+    }
+    char * src = (char *) malloc(bytes);
+    memset(src, 1, bytes);
+    for (int rep = 0; rep < 3; ++rep) {
+        const double t0 = h2d_now_ms();
+        gk_backend_tensor_set(whole, src, 0, bytes);
+        gk_backend_synchronize(gpu);
+        const double t1 = h2d_now_ms();
+        for (int i = 0; i < n_parts; ++i) {
+            gk_backend_tensor_set(parts[i], src + (size_t) i * (bytes / n_parts), 0, bytes / n_parts);
+        }
+        gk_backend_synchronize(gpu);
+        const double t2 = h2d_now_ms();
+        printf("h2d 2 GB whole: %.0f ms (%.2f GB/s), in 64 x 32 MB: %.0f ms (%.2f GB/s)\n",
+               t1 - t0, 2000.0 / (t1 - t0), t2 - t1, 2000.0 / (t2 - t1));
+    }
+    free(src);
+    gk_backend_buffer_free(buf);
+    gk_free(ctx);
+    return 0;
+}
+
 int main(void) {
     gk_device_t device = gk_device_by_type(GK_DEVICE_TYPE_GPU);
     if (device == NULL) {
@@ -2662,6 +2740,9 @@ int main(void) {
     if (gpu == NULL) {
         fprintf(stderr, "failed to initialize backend for %s\n", gk_device_name(device));
         return 1;
+    }
+    if (getenv("GK_TEST_H2D") != NULL) {
+        return bench_h2d(gpu);
     }
 
     printf("%s: %s\n", gk_device_name(device), gk_device_description(device));
@@ -2790,6 +2871,9 @@ int main(void) {
     failures += run_op_tol(gpu, "mmq q5_K",      build_mmq_q5_K,     8e-2f);
     failures += run_op_tol(gpu, "mmq q5_K tiles", build_mmq_q5_K_tiles, 8e-2f);
     failures += run_op_tol(gpu, "mmq q4_K tiles", build_mmq_q4_K_tiles, 8e-2f);
+    failures += run_op_tol(gpu, "mmq q6_K tiles", build_mmq_q6_K_tiles, 1e-1f);
+    failures += run_op_tol(gpu, "mmq q3_K tiles", build_mmq_q3_K_tiles, 1e-1f);
+    failures += run_op_tol(gpu, "mm bf16 tile",   build_mm_bf16_tile,   4e-3f);
     failures += run_op_tol(gpu, "mmq batched",   build_mmq_batched,  4e-2f);
     failures += run_op_tol(gpu, "mmq ragged k",  build_mmq_ragged_k, 4e-2f);
 

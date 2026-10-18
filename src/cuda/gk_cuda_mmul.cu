@@ -3474,7 +3474,12 @@ static __host__ __forceinline__ bool gk_cuda_mma_f16_supported(const struct gk_t
     if (s == NULL || s->cc < 80) {
         return false;
     }
-    if ((int) dst->src[0]->type != GK_TYPE_F16) {
+    // bf16 rides the same tile: the staging pass converts the weight rows to
+    // f16 (a bf16 weight is far inside f16's range, and f16 has the finer
+    // mantissa), so the kernel never sees the difference. Before this a bf16
+    // text encoder - LTX-2.5's Gemma 4 - ran on the float tile at a tenth of
+    // the throughput.
+    if ((int) dst->src[0]->type != GK_TYPE_F16 && (int) dst->src[0]->type != GK_TYPE_BF16) {
         return false;
     }
     if (gk_get_op_params_i32(dst, 0) == GK_PREC_F32) {
@@ -5067,6 +5072,569 @@ void gk_cu_k_mul_mat_mma_k45_pipe(gk_tview a, gk_tview_mut d,
 }
 
 // --------------------------------------------------------------------------
+// The q3_K / q6_K pipeline tile.
+//
+// The same pipeline for the two k-quants whose scale changes at element
+// sixteen: a group is two k16 mma windows drained where the scale changes,
+// exactly the generic tile's split identity, and the codes stay unsigned with
+// the format's uniform minimum (-4 for q3_K, -32 for q6_K) as the offset
+// term - so the results are the generic tile's to the bit.
+//
+// What these two formats add is alignment. A q3_K block is 110 bytes and a
+// q6_K block 210, so an odd superblock - and, when a row holds an odd number
+// of them, every other row - starts two bytes into a word, which cp.async
+// cannot take. Each range is staged from the word below it with one word to
+// spare, and the decode reassembles the two-byte-shifted word with a funnel
+// shift under a per-row flag (the shift is uniform per row, and rows eight
+// apart share it). The extra word always lies inside the block: every range
+// staged this way is followed by more of the block, and the trailing 16-bit
+// `d` is fetched with a plain load instead.
+//
+// Cadence: q6_K's run (64 bytes of ql, 32 of qh) and q3_K's run (32 bytes of
+// qs) serve four groups each - two rounds - and stage once per half, a round
+// ahead; the header (scales, d, and q3_K's hmask plane) stages once per
+// superblock. q6_K's buffers come to 56 KB, past the static limit, so the
+// kernel takes dynamic shared memory with the per-device opt-in and q3_K
+// (47 KB) rides the same path for one launch sequence. Two blocks per SM
+// where the part's shared allows it (Blackwell), one on Ada for q6_K.
+// --------------------------------------------------------------------------
+
+template <int TYPE> struct gk_cu_k36_geom {
+    static constexpr bool Q6   = TYPE == GKT_Q6_K;
+    static constexpr int  TM   = GK_CU_MMAQ_TILE_M;
+    static constexpr int  TN   = GK_CU_MMAQ_TILE_N;
+    static constexpr int  BLK  = Q6 ? 2 + GK_QK / 16 + 3 * GK_QK / 4 : GK_QK / 8 + GK_QK / 4 + 12 + 2;
+    static constexpr int  NQL  = Q6 ? 16 : 8;   // run words a half stages (ql / qs)
+    static constexpr int  NQH  = 8;             // q6: a half's qh; q3: the superblock's hmask
+    static constexpr int  NSC  = Q6 ? 4 : 3;    // scale words
+    static constexpr int  QL_OFF = Q6 ? 0 : GK_QK / 8;           // ql / qs
+    static constexpr int  QH_OFF = Q6 ? GK_QK / 2 : 0;           // qh / hmask
+    static constexpr int  SC_OFF = Q6 ? GK_QK / 2 + GK_QK / 4 : GK_QK / 8 + GK_QK / 4;
+    static constexpr int  D_OFF  = SC_OFF + (Q6 ? 16 : 12);
+    // the shared carve, in bytes
+    static constexpr size_t AQL  = (size_t) 2 * TM * (NQL + 1) * 4;
+    static constexpr size_t AQH  = (size_t) 2 * TM * (NQH + 1) * 4;
+    static constexpr size_t ASC  = (size_t) 2 * TM * (NSC + 1) * 4;
+    static constexpr size_t ASCD = (size_t) 2 * TM * 4 * 4;   // the sixteen scales, decoded to int8
+    static constexpr size_t AD   = (size_t) 2 * TM * 4;
+    static constexpr size_t AMIS = (size_t) TM * 4;
+    static constexpr size_t BS   = (size_t) 2 * 2 * TN * 9 * 4;
+    static constexpr size_t APL  = (size_t) 2 * 2 * 3 * TN * 4;
+    static constexpr size_t O_AQH  = AQL;
+    static constexpr size_t O_ASC  = O_AQH + AQH;
+    static constexpr size_t O_ASCD = O_ASC + ASC;
+    static constexpr size_t O_AD   = O_ASCD + ASCD;
+    static constexpr size_t O_AMIS = O_AD + AD;
+    static constexpr size_t O_BS   = O_AMIS + AMIS;
+    static constexpr size_t O_APL  = O_BS + BS;
+    static constexpr size_t SMEM   = O_APL + APL;
+};
+
+// the staged word `i` of a range, two bytes shifted when the row was
+static __device__ __forceinline__ int gk_cu_k36_vword(const int * w, int i, bool mis) {
+    const int shifted = (int) __funnelshift_r((unsigned) w[i], (unsigned) w[i + 1], 16);
+    return mis ? shifted : w[i];
+}
+
+template <int TYPE>
+static __global__ __launch_bounds__(GK_CU_MMAQ_THREADS, 2)
+void gk_cu_k_mul_mat_mma_k36_pipe(gk_tview a, gk_tview_mut d,
+                                  const gk_cu_q8blk * aq, const float * ap,
+                                  int64_t n_grp, int64_t r2, int64_t r3,
+                                  int act, float4 actp) {
+    static_assert(TYPE == GKT_Q3_K || TYPE == GKT_Q6_K, "the two split-scale k-quants");
+    using G = gk_cu_k36_geom<TYPE>;
+    constexpr bool Q6      = G::Q6;
+    constexpr int  TM      = G::TM;
+    constexpr int  THREADS = GK_CU_MMAQ_THREADS;
+    constexpr int  NCOL    = THREADS / 4;
+    constexpr int  NB      = G::TN / NCOL;
+    constexpr int  NQL     = G::NQL;
+    constexpr int  NQH     = G::NQH;
+    constexpr int  NSC     = G::NSC;
+    constexpr int  BLK     = G::BLK;
+
+    static_assert(GK_CU_MMAQ_KSTEP == 2 && G::TN == 128 && TM == 128,
+                  "the pipeline stage assumes this geometry");
+
+    extern __shared__ __align__(16) unsigned char gk_cu_k36_smem[];
+    int      (*Aql)[TM][NQL + 1]     = (int      (*)[TM][NQL + 1])     (gk_cu_k36_smem);
+    int      (*Aqh)[TM][NQH + 1]     = (int      (*)[TM][NQH + 1])     (gk_cu_k36_smem + G::O_AQH);
+    int      (*Asc)[TM][NSC + 1]     = (int      (*)[TM][NSC + 1])     (gk_cu_k36_smem + G::O_ASC);
+    int      (*Ascd)[TM][4]          = (int      (*)[TM][4])           (gk_cu_k36_smem + G::O_ASCD);
+    uint32_t (*Ad)[TM]               = (uint32_t (*)[TM])               (gk_cu_k36_smem + G::O_AD);
+    int      *Amis                   = (int *)                          (gk_cu_k36_smem + G::O_AMIS);
+    int      (*Bs)[2][G::TN][9]      = (int      (*)[2][G::TN][9])      (gk_cu_k36_smem + G::O_BS);
+    float    (*Apl)[2][3][G::TN]     = (float    (*)[2][3][G::TN])     (gk_cu_k36_smem + G::O_APL);
+
+    const int lane  = threadIdx.x % GK_WARP_SIZE;
+    const int warp  = threadIdx.x / GK_WARP_SIZE;
+    const int group = lane / 4;
+    const int tig   = lane % 4;
+
+    const int warp_m = warp / GK_CU_MMAQ_WARPS_N;
+    const int warp_n = warp % GK_CU_MMAQ_WARPS_N;
+
+    const int64_t m0  = (int64_t) blockIdx.x * TM;
+    const int64_t n0  = (int64_t) blockIdx.y * G::TN;
+    const int64_t i23 = blockIdx.z;
+
+    const int64_t i2 = i23 % d.ne[2];
+    const int64_t i3 = i23 / d.ne[2];
+
+    const int64_t a2 = i2 / r2;
+    const int64_t a3 = i3 / r3;
+
+    const int64_t n_rows = d.ne[0];
+    const int64_t n_cols = d.ne[1];
+
+    const gk_cu_q8blk * aq23 = aq + i23 * n_cols * n_grp;
+    const float *       ap23 = ap + i23 * n_cols * n_grp * 3;
+
+    const int stage_w = 2 * ((int) threadIdx.x % 4);
+    const int stage_c = (int) threadIdx.x / 4;
+
+    const uint8_t * frow[2] = { NULL, NULL };
+    bool            fmis[2] = { false, false };
+#pragma unroll
+    for (int j = 0; j < 2; ++j) {
+        const int64_t m = m0 + stage_c + j * NCOL;
+        if (m < n_rows) {
+            frow[j] = (const uint8_t *) gk_cu_row(a, m, a2, a3);
+            fmis[j] = (((uintptr_t) frow[j]) & 2u) != 0;
+        }
+    }
+
+    const int       hdr_r   = (int) threadIdx.x % TM;
+    const bool      hdr_hi  = (int) threadIdx.x >= TM;
+    const uint8_t * hdr_row = m0 + hdr_r < n_rows
+        ? (const uint8_t *) gk_cu_row(a, m0 + hdr_r, a2, a3) : NULL;
+    const bool      hdr_mis = hdr_row != NULL && (((uintptr_t) hdr_row) & 2u) != 0;
+
+    const gk_cu_q8blk * bblk[NB] = {};
+#pragma unroll
+    for (int j = 0; j < NB; ++j) {
+        const int64_t n = n0 + stage_c + j * NCOL;
+        if (n < n_cols) {
+            bblk[j] = aq23 + n * n_grp;
+        }
+    }
+
+    const int  pl_c  = (int) threadIdx.x % G::TN;
+    const int  pl_s  = (int) threadIdx.x / G::TN;
+    const bool pl_ok = pl_s < 2 && n0 + pl_c < n_cols;
+
+    // the per-row shift flag, and zeros for the rows and columns past the edge
+    {
+        const int x = (int) threadIdx.x % TM;
+        const int h = (int) threadIdx.x / TM;
+        if (h == 0) {
+            Amis[x] = hdr_mis ? 1 : 0;
+        }
+        if (m0 + x >= n_rows) {
+            if (h == 0) {
+#pragma unroll
+                for (int b = 0; b < 2; ++b) {
+#pragma unroll
+                    for (int i = 0; i <= NQL; ++i) { Aql[b][x][i] = 0; }
+#pragma unroll
+                    for (int i = 0; i <= NQH; ++i) { Aqh[b][x][i] = 0; }
+                }
+            } else {
+#pragma unroll
+                for (int b = 0; b < 2; ++b) {
+#pragma unroll
+                    for (int i = 0; i <= NSC; ++i) { Asc[b][x][i] = 0; }
+#pragma unroll
+                    for (int i = 0; i < 4; ++i) { Ascd[b][x][i] = 0; }
+                    Ad[b][x] = 0;
+                }
+            }
+        }
+
+        const int c  = (int) threadIdx.x % G::TN;
+        const int h2 = (int) threadIdx.x / G::TN;
+        if (n0 + c >= n_cols && h2 < 2) {
+            if (h2 == 0) {
+#pragma unroll
+                for (int b = 0; b < 2; ++b) {
+#pragma unroll
+                    for (int sg = 0; sg < 2; ++sg) {
+#pragma unroll
+                        for (int i = 0; i < 8; ++i) { Bs[b][sg][c][i] = 0; }
+                    }
+                }
+            } else {
+#pragma unroll
+                for (int b = 0; b < 2; ++b) {
+#pragma unroll
+                    for (int sg = 0; sg < 2; ++sg) {
+#pragma unroll
+                        for (int q = 0; q < 3; ++q) { Apl[b][sg][q][c] = 0.0f; }
+                    }
+                }
+            }
+        }
+    }
+
+    // `len` words of the block range at `off`, from the word below when the
+    // row is shifted, plus the spare word the funnel shift reads
+    const auto stage_range = [&](int * dstw, const uint8_t * blk, bool mis, int off, int len) {
+        const uint8_t * src = blk + off - (mis ? 2 : 0);
+        for (int w = stage_w; w < len; w += 8) {
+            gk_cu_cp_async4(&dstw[w], src + 4 * w);
+            if (w + 1 < len) {
+                gk_cu_cp_async4(&dstw[w + 1], src + 4 * w + 4);
+            }
+        }
+        if (mis && stage_w == 0) {
+            gk_cu_cp_async4(&dstw[len], src + 4 * len);
+        }
+    };
+
+    // the run stage, once per half (four groups)
+    const auto stage_half = [&](int64_t hf, int hb) {
+        const int64_t sb = hf >> 1;
+        const int     hh = (int) (hf & 1);
+#pragma unroll
+        for (int jr = 0; jr < 2; ++jr) {
+            const uint8_t * rp = frow[jr];
+            if (rp != NULL) {
+                const int  r   = stage_c + jr * NCOL;
+                const bool mis = fmis[jr] ^ ((sb & 1) != 0);
+                const uint8_t * blk = rp + sb * BLK;
+                stage_range(Aql[hb][r], blk, mis, G::QL_OFF + hh * (Q6 ? 64 : 32), NQL);
+                if constexpr (Q6) {
+                    stage_range(Aqh[hb][r], blk, mis, G::QH_OFF + hh * 32, NQH);
+                }
+            }
+        }
+    };
+
+    // the header stage, once per superblock: the low half of the block the
+    // scales (q3_K: and the hmask plane), the high half d by a plain load
+    const auto stage_sb = [&](int64_t sb, int sbb) {
+        if (hdr_row == NULL) {
+            return;
+        }
+        const uint8_t * blk = hdr_row + sb * BLK;
+        const bool      mis = hdr_mis ^ ((sb & 1) != 0);
+        if (!hdr_hi) {
+            // one thread per row stages these ranges alone: every word, and
+            // the spare one when shifted
+            {
+                const uint8_t * src = blk + G::SC_OFF - (mis ? 2 : 0);
+#pragma unroll
+                for (int w = 0; w < NSC; ++w) {
+                    gk_cu_cp_async4(&Asc[sbb][hdr_r][w], src + 4 * w);
+                }
+                if (mis) {
+                    gk_cu_cp_async4(&Asc[sbb][hdr_r][NSC], src + 4 * NSC);
+                }
+            }
+            if constexpr (!Q6) {
+                const uint8_t * src = blk + G::QH_OFF - (mis ? 2 : 0);
+#pragma unroll
+                for (int w = 0; w < NQH; ++w) {
+                    gk_cu_cp_async4(&Aqh[sbb][hdr_r][w], src + 4 * w);
+                }
+                if (mis) {
+                    gk_cu_cp_async4(&Aqh[sbb][hdr_r][NQH], src + 4 * NQH);
+                }
+            }
+        } else {
+            Ad[sbb][hdr_r] = (uint32_t) *(const uint16_t *) (blk + G::D_OFF);
+        }
+    };
+
+    const auto stage_b = [&](int64_t it, int buf) {
+        const int64_t g = it * 2;
+#pragma unroll
+        for (int it2 = 0; it2 < 2 * NB; ++it2) {
+            const int jj = it2 % NB;
+            const int sg = it2 / NB;
+            const int c  = stage_c + jj * NCOL;
+            const int64_t gk = g + sg;
+            const gk_cu_q8blk * bp = bblk[jj];
+            if (bp != NULL && gk < n_grp) {
+                gk_cu_cp_async4(&Bs[buf][sg][c][stage_w    ], &bp[gk].q[stage_w    ]);
+                gk_cu_cp_async4(&Bs[buf][sg][c][stage_w + 1], &bp[gk].q[stage_w + 1]);
+            }
+        }
+        {
+            const int64_t gk = g + pl_s;
+            if (pl_ok && gk < n_grp) {
+                const float * p = ap23 + gk * 3 * n_cols + (n0 + pl_c);
+#pragma unroll
+                for (int q = 0; q < 3; ++q) {
+                    gk_cu_cp_async4(&Apl[buf][pl_s][q][pl_c], p + q * n_cols);
+                }
+            }
+        }
+    };
+
+    float acc[GK_CU_MMAQ_WMT][GK_CU_MMAQ_WNT][4];
+#pragma unroll
+    for (int wt = 0; wt < GK_CU_MMAQ_WMT; ++wt) {
+#pragma unroll
+        for (int ct = 0; ct < GK_CU_MMAQ_WNT; ++ct) {
+#pragma unroll
+            for (int i = 0; i < 4; ++i) {
+                acc[wt][ct][i] = 0.0f;
+            }
+        }
+    }
+
+    const int64_t n_iter = (n_grp + 1) / 2;   // rounds
+    const int64_t n_half = (n_iter + 1) / 2;
+    const int64_t n_sb   = (n_iter + 3) / 4;
+
+    stage_sb(0, 0);
+    stage_half(0, 0);
+    stage_b(0, 0);
+    gk_cu_cp_async_commit();
+
+    for (int64_t it = 0; it < n_iter; ++it) {
+        const int buf = (int) (it & 1);
+        const int hb  = (int) ((it >> 1) & 1);
+        const int sbb = (int) ((it >> 2) & 1);
+        const int j   = (int) (it & 3);
+
+        if (it + 1 < n_iter) {
+            stage_b(it + 1, buf ^ 1);
+            if ((it & 1) == 1 && (it >> 1) + 1 < n_half) {
+                stage_half((it >> 1) + 1, hb ^ 1);
+            }
+            if (j == 3 && (it >> 2) + 1 < n_sb) {
+                stage_sb((it >> 2) + 1, sbb ^ 1);
+            }
+            gk_cu_cp_async_commit();
+            gk_cu_cp_async_wait<1>();
+        } else {
+            gk_cu_cp_async_wait<0>();
+        }
+        __syncthreads();
+
+        const int64_t g      = it * 2;
+        const int     sbodd  = (int) ((it >> 2) & 1);
+        const int     which2 = (int) (it & 1);       // the half's first or second pair
+
+        // A superblock's first round decodes its scales once per row - the
+        // shift undone, q3_K's twelve packed bytes unpacked to sixteen - so
+        // the per-group fragment decode below is a byte select. One thread
+        // per row, one extra barrier every four rounds; done per fragment
+        // the q3_K unpack cost more than the staging saved.
+        if (j == 0) {
+            if ((int) threadIdx.x < TM) {
+                const int  r = (int) threadIdx.x;
+                const bool m = (Amis[r] ^ sbodd) != 0;
+                if constexpr (Q6) {
+#pragma unroll
+                    for (int w = 0; w < 4; ++w) {
+                        Ascd[sbb][r][w] = gk_cu_k36_vword(Asc[sbb][r], w, m);
+                    }
+                } else {
+                    const int w0 = gk_cu_k36_vword(Asc[sbb][r], 0, m);
+                    const int w1 = gk_cu_k36_vword(Asc[sbb][r], 1, m);
+                    const int w2 = gk_cu_k36_vword(Asc[sbb][r], 2, m);
+                    const auto byte_at = [&](int i) -> int {
+                        const int w = i < 4 ? w0 : (i < 8 ? w1 : w2);
+                        return (w >> (8 * (i & 3))) & 0xff;
+                    };
+                    int outw[4] = { 0, 0, 0, 0 };
+#pragma unroll
+                    for (int gs = 0; gs < 16; ++gs) {
+                        const int low  = gs < 8 ? (byte_at(gs) & 0xf) : (byte_at(gs - 8) >> 4);
+                        const int high = (byte_at(8 + (gs & 3)) >> (2 * (gs >> 2))) & 3;
+                        const int sc   = ((low | (high << 4)) - 32) & 0xff;
+                        outw[gs >> 2] |= sc << (8 * (gs & 3));
+                    }
+#pragma unroll
+                    for (int w = 0; w < 4; ++w) {
+                        Ascd[sbb][r][w] = outw[w];
+                    }
+                }
+            }
+            __syncthreads();
+        }
+
+        // row state read once per round: shift flags, d, scale words
+        bool  mis[GK_CU_MMAQ_WMT][2];
+        float dv [GK_CU_MMAQ_WMT][2];
+        int   r_of[GK_CU_MMAQ_WMT];
+#pragma unroll
+        for (int wt = 0; wt < GK_CU_MMAQ_WMT; ++wt) {
+            r_of[wt] = warp_m * GK_CU_MMAQ_WM + wt * 16 + group;
+#pragma unroll
+            for (int rh = 0; rh < 2; ++rh) {
+                const int r = r_of[wt] + 8 * rh;
+                mis[wt][rh] = (Amis[r] ^ sbodd) != 0;
+                dv [wt][rh] = gk_cu_h2f2_w(Ad[sbb][r]).x;
+            }
+        }
+
+#pragma unroll
+        for (int gg = 0; gg < 2; ++gg) {
+            if (g + gg >= n_grp) {
+                break;
+            }
+            const int sub = 2 * j + gg;   // group within its superblock
+
+            int   af [GK_CU_MMAQ_WMT][4];
+            float ws [GK_CU_MMAQ_WMT][2];
+            float wsh[GK_CU_MMAQ_WMT][2];
+
+#pragma unroll
+            for (int wt = 0; wt < GK_CU_MMAQ_WMT; ++wt) {
+#pragma unroll
+                for (int rh = 0; rh < 2; ++rh) {
+                    const int  r = r_of[wt] + 8 * rh;
+                    const bool m = mis[wt][rh];
+                    int code_lo, code_hi;
+                    int sc0, sc1;
+
+                    if constexpr (Q6) {
+                        const int which = 2 * which2 + gg;
+                        const int wb    = (which & 1) * 8;
+                        const int nib   = which >= 2 ? 4 : 0;
+                        const int hsh   = 2 * which;
+                        const int lw_lo = gk_cu_k36_vword(Aql[hb][r], wb + tig,     m);
+                        const int lw_hi = gk_cu_k36_vword(Aql[hb][r], wb + 4 + tig, m);
+                        const int hw_lo = gk_cu_k36_vword(Aqh[hb][r], tig,     m);
+                        const int hw_hi = gk_cu_k36_vword(Aqh[hb][r], 4 + tig, m);
+                        code_lo = ((lw_lo >> nib) & 0x0F0F0F0F) | (((hw_lo >> hsh) & 0x03030303) << 4);
+                        code_hi = ((lw_hi >> nib) & 0x0F0F0F0F) | (((hw_hi >> hsh) & 0x03030303) << 4);
+                        // centred in the integer domain: c - 32 is c with bit 5
+                        // flipped and sign-extended, byte-parallel, so the
+                        // drain needs no offset term
+                        {
+                            const int s_lo = (~code_lo) & 0x20202020;
+                            const int s_hi = (~code_hi) & 0x20202020;
+                            code_lo = (code_lo ^ 0x20202020) | (s_lo << 1) | (s_lo << 2);
+                            code_hi = (code_hi ^ 0x20202020) | (s_hi << 1) | (s_hi << 2);
+                        }
+                        // the int8 scales: byte half*8 + 2*which + h (bi is even)
+                        const int bi  = (sub >> 2) * 8 + 2 * which;
+                        const int scw = Ascd[sbb][r][bi >> 2];
+                        sc0 = (int) (int8_t) ((scw >> (8 * (bi & 3)))       & 0xff);
+                        sc1 = (int) (int8_t) ((scw >> (8 * (bi & 3) + 8))   & 0xff);
+                    } else {
+                        const int shift = 2 * (sub & 3);
+                        const int lw_lo = gk_cu_k36_vword(Aql[hb][r], tig,     m);
+                        const int lw_hi = gk_cu_k36_vword(Aql[hb][r], 4 + tig, m);
+                        const int hw_lo = gk_cu_k36_vword(Aqh[sbb][r], tig,     m);
+                        const int hw_hi = gk_cu_k36_vword(Aqh[sbb][r], 4 + tig, m);
+                        code_lo = ((lw_lo >> shift) & 0x03030303) | (((hw_lo >> sub) & 0x01010101) << 2);
+                        code_hi = ((lw_hi >> shift) & 0x03030303) | (((hw_hi >> sub) & 0x01010101) << 2);
+                        // centred: c - 4 is c with bit 2 flipped and bits 3..7
+                        // set where it was clear
+                        {
+                            const int s_lo = ((~code_lo) & 0x04040404) >> 2;
+                            const int s_hi = ((~code_hi) & 0x04040404) >> 2;
+                            code_lo = (code_lo ^ 0x04040404) | (s_lo * 0xF8);
+                            code_hi = (code_hi ^ 0x04040404) | (s_hi * 0xF8);
+                        }
+                        // the group's two scales, already unpacked: bytes 2*sub, 2*sub+1
+                        const int bi  = 2 * sub;
+                        const int scw = Ascd[sbb][r][bi >> 2];
+                        sc0 = (int) (int8_t) ((scw >> (8 * (bi & 3)))     & 0xff);
+                        sc1 = (int) (int8_t) ((scw >> (8 * (bi & 3) + 8)) & 0xff);
+                    }
+
+                    af[wt][rh]     = code_lo;
+                    af[wt][rh + 2] = code_hi;
+                    ws [wt][rh] = dv[wt][rh] * (float) sc0;
+                    wsh[wt][rh] = dv[wt][rh] * (float) sc1;
+                }
+            }
+
+#pragma unroll
+            for (int ct = 0; ct < GK_CU_MMAQ_WNT; ++ct) {
+                const int c = warp_n * GK_CU_MMAQ_WN + ct * 8 + group;
+
+                int bf[2];
+                bf[0] = Bs[buf][gg][c][tig];
+                bf[1] = Bs[buf][gg][c][4 + tig];
+
+                const int cd = warp_n * GK_CU_MMAQ_WN + ct * 8 + tig * 2;
+
+                // centred codes: the activation scale alone, no offset planes
+                const float2 advv = *(const float2 *) &Apl[buf][gg][0][cd];
+                const float  adv[2] = { advv.x, advv.y };
+
+#pragma unroll
+                for (int wt = 0; wt < GK_CU_MMAQ_WMT; ++wt) {
+                    const int af_lo[2] = { af[wt][0], af[wt][1] };
+                    const int af_hi[2] = { af[wt][2], af[wt][3] };
+
+                    int df0[4] = { 0, 0, 0, 0 };
+                    int df1[4] = { 0, 0, 0, 0 };
+                    gk_cu_mma_s8(df0, af_lo, bf[0]);
+                    gk_cu_mma_s8(df1, af_hi, bf[1]);
+
+#pragma unroll
+                    for (int i = 0; i < 4; ++i) {
+                        const int rh = i >> 1;
+                        const int ch = i & 1;
+                        acc[wt][ct][i] += adv[ch] * fmaf(wsh[wt][rh], (float) df1[i],
+                                                         ws[wt][rh] * (float) df0[i]);
+                    }
+                }
+            }
+        }
+
+        __syncthreads();
+    }
+
+#pragma unroll
+    for (int wt = 0; wt < GK_CU_MMAQ_WMT; ++wt) {
+#pragma unroll
+        for (int ct = 0; ct < GK_CU_MMAQ_WNT; ++ct) {
+#pragma unroll
+            for (int i = 0; i < 4; ++i) {
+                const int64_t m = m0 + warp_m * GK_CU_MMAQ_WM + wt * 16
+                                + group + (i >= 2 ? 8 : 0);
+                const int64_t n = n0 + warp_n * GK_CU_MMAQ_WN + ct * 8
+                                + tig * 2 + (i & 1);
+                if (m < n_rows && n < n_cols) {
+                    float v = acc[wt][ct][i];
+                    if (act >= 0) {
+                        v = gk_cu_unary(act, v, actp.x, actp.y, actp.z, actp.w);
+                    }
+                    gk_cu_set(d, m, n, i2, i3, v);
+                }
+            }
+        }
+    }
+}
+
+// the one-time dynamic-shared opt-in, per device (the attribute is per
+// device: see the flash-attention kernels' note)
+template <int TYPE>
+static __host__ bool gk_cu_k36_pipe_ready(const struct gk_cuda_scratch * scratch) {
+    using G = gk_cu_k36_geom<TYPE>;
+    if (scratch == NULL || (size_t) scratch->smem_max < G::SMEM) {
+        return false;
+    }
+    if (G::SMEM > 48u * 1024u) {
+        static bool raised[GK_CUDA_MAX_DEVICES] = { false };
+        int dev = 0;
+        if (gkGetDevice(&dev) != gkSuccess || dev < 0 || dev >= GK_CUDA_MAX_DEVICES) {
+            return false;
+        }
+        if (!raised[dev]) {
+            if (gkFuncSetAttribute((const void *) gk_cu_k_mul_mat_mma_k36_pipe<TYPE>,
+                                   gkFuncAttributeMaxDynamicSharedMemorySize,
+                                   (int) G::SMEM) != gkSuccess) {
+                return false;
+            }
+            raised[dev] = true;
+        }
+    }
+    return true;
+}
+
+// --------------------------------------------------------------------------
 // The nvfp4 integer tile, pipelined.
 //
 // The synchronous tile above stages a decoded round, barriers, computes, and
@@ -6218,7 +6786,8 @@ void gk_cuda_mul_mat(gkStream_t stream, struct gk_cuda_scratch * scratch,
             // k padded to the round. `GK_MM_F16_PIPE=0` is the bisect lever
             // back to the register-staged tile.
             const bool pipe_ok  = gk_cu_env_int("GK_MM_F16_PIPE", 1) != 0;
-            const bool a_direct = pipe_ok && a_al == 16 && gk_is_contiguous(src0);
+            const bool a_direct = pipe_ok && (int) src0->type == GK_TYPE_F16 && a_al == 16 &&
+                                  gk_is_contiguous(src0);
             const bool b_direct = pipe_ok && (int) src1->type == GK_TYPE_F16 && b_al == 16 &&
                                   gk_is_contiguous(src1);
             const int64_t k_pad   = (k_len + GK_CU_F16P_K - 1) / GK_CU_F16P_K * GK_CU_F16P_K;
@@ -6489,6 +7058,33 @@ void gk_cuda_mul_mat(gkStream_t stream, struct gk_cuda_scratch * scratch,
                                 g_gk_mm_act, g_gk_mm_actp);
                         }
                         return;
+                    }
+
+                    // q3_K and q6_K: the split-scale pipeline tile, on
+                    // dynamic shared memory
+                    if (((int) src0->type == GKT_Q6_K || (int) src0->type == GKT_Q3_K) &&
+                        gk_cu_env_int("GK_MM_MMA_PIPE", 1) != 0) {
+                        struct gk_tensor * fdst =
+                            g_gk_mm_act_dst != NULL ? g_gk_mm_act_dst : dst;
+                        if ((int) src0->type == GKT_Q6_K) {
+                            if (gk_cu_k36_pipe_ready<GKT_Q6_K>(scratch)) {
+                                g_gk_mm_path = "mma-q8p";
+                                gk_cu_k_mul_mat_mma_k36_pipe<GKT_Q6_K>
+                                    <<<mgrid, GK_CU_MMAQ_THREADS, gk_cu_k36_geom<GKT_Q6_K>::SMEM, stream>>>(
+                                    gk_cu_view(src0), gk_cu_view_mut(fdst), aq, ap, n_grp, r2, r3,
+                                    g_gk_mm_act, g_gk_mm_actp);
+                                return;
+                            }
+                        } else {
+                            if (gk_cu_k36_pipe_ready<GKT_Q3_K>(scratch)) {
+                                g_gk_mm_path = "mma-q8p";
+                                gk_cu_k_mul_mat_mma_k36_pipe<GKT_Q3_K>
+                                    <<<mgrid, GK_CU_MMAQ_THREADS, gk_cu_k36_geom<GKT_Q3_K>::SMEM, stream>>>(
+                                    gk_cu_view(src0), gk_cu_view_mut(fdst), aq, ap, n_grp, r2, r3,
+                                    g_gk_mm_act, g_gk_mm_actp);
+                                return;
+                            }
+                        }
                     }
 
 #define GK_CU_LAUNCH_MMA_Q8(T)                                                            \
