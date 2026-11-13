@@ -703,6 +703,7 @@ FWD_GLU(geglu,       GK_GLU_OP_GEGLU)
 FWD_GLU(swiglu,      GK_GLU_OP_SWIGLU)
 FWD_GLU(geglu_erf,   GK_GLU_OP_GEGLU_ERF)
 FWD_GLU(geglu_quick, GK_GLU_OP_GEGLU_QUICK)
+FWD_GLU(situ,        GK_GLU_OP_SITU)
 
 struct ggml_tensor * ggml_swiglu_oai(struct ggml_context * ctx, struct ggml_tensor * a,
                                      struct ggml_tensor * b, float alpha, float limit) {
@@ -1285,6 +1286,11 @@ struct ggml_tensor * ggml_pad_ext_circular(struct ggml_context * ctx, struct ggm
 struct ggml_tensor * ggml_pad_reflect_1d(struct ggml_context * ctx, struct ggml_tensor * a,
                               int p0, int p1) {
     return GGT(gk_pad_reflect_1d(CTX, GKT(a), p0, p1));
+}
+
+struct ggml_tensor * ggml_rope_pe(struct ggml_context * ctx, struct ggml_tensor * a, struct ggml_tensor * pe,
+                                  bool interleaved, enum ggml_type type) {
+    return GGT(gk_rope_pe(CTX, GKT(a), GKT(pe), interleaved, (enum gk_type) type));
 }
 
 struct ggml_tensor * ggml_roll(struct ggml_context * ctx, struct ggml_tensor * a,

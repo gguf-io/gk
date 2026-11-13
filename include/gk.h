@@ -243,6 +243,7 @@ enum gk_op {
     GK_OP_OPT_STEP_SGD,
 
     GK_OP_GLU,
+    GK_OP_ROPE_PE,
 
     GK_OP_COUNT,
 };
@@ -285,6 +286,9 @@ enum gk_glu_op {
     GK_GLU_OP_SWIGLU_OAI,
     GK_GLU_OP_GEGLU_ERF,
     GK_GLU_OP_GEGLU_QUICK,
+    // MOSS-Image's soft-capped gated unit: 4*tanh(a/4)*sigmoid(a) * 25*tanh(b/25),
+    // a the activated side, b the multiplier (gk_glu_split(a, b, SITU))
+    GK_GLU_OP_SITU,
     GK_GLU_OP_COUNT,
 };
 
@@ -357,6 +361,10 @@ enum gk_tensor_flag {
     GK_TENSOR_FLAG_PARAM   = 4,  // trainable
     GK_TENSOR_FLAG_LOSS    = 8,  // contributes to a training loss
     GK_TENSOR_FLAG_COMPUTE = 16, // must be evaluated even if nothing reads it
+    // A q8_0 weight whose block scales are one value per row (an int8 weight
+    // with a row scale, repacked). A backend may then keep a whole dot
+    // product in integers - see the i8u tile in gk_cuda_mmul.cu.
+    GK_TENSOR_FLAG_ROW_SCALE = 32,
 };
 
 // --------------------------------------------------------------------------
@@ -721,6 +729,16 @@ GK_API struct gk_tensor * gk_rope_ext(struct gk_ctx *, struct gk_tensor * a, str
                                       int n_dims, int mode, int n_ctx_orig,
                                       float freq_base, float freq_scale, float ext_factor,
                                       float attn_factor, float beta_fast, float beta_slow);
+
+// Rotary embedding from a precomputed pair table, the diffusion models'
+// flavor. `a` is [D, H, L, N] - a projection split into heads, rows packed,
+// any outer strides - and `pe` is [2, 2, D/2, L] holding [[cos, -sin],
+// [sin, cos]] per (position, pair). The result is [D, L, H, N], the layout
+// attention reads, in `type` (f32 or f16). Pairs are (2k, 2k+1) when
+// interleaved and (k, k + D/2) otherwise. Spelled out with permutes, repeats
+// and multiplies this was four passes over each of q and k per block.
+GK_API struct gk_tensor * gk_rope_pe(struct gk_ctx *, struct gk_tensor * a, struct gk_tensor * pe,
+                                     bool interleaved, enum gk_type type);
 
 // The multi-axis rope for vision models: `sections` says how many cos/sin
 // pairs each position axis (time, height, width, extra) owns, and `pos`

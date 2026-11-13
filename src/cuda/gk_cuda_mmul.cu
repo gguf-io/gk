@@ -1494,7 +1494,7 @@ static __global__ __launch_bounds__(GK_CU_NVD_THREADS_OF(WARPS_N), WARPS_N == 2 
 void gk_cu_k_mul_mat_mma_nvfp4_deep(gk_tview a, gk_tview_mut d,
                                     const uint8_t * __restrict__ codes,
                                     const float * __restrict__ scales,
-                                    int64_t n_grp, int64_t r2, int64_t r3) {
+                                    int64_t n_grp, int64_t r2, int64_t r3, int cols_on_x) {
     constexpr int TILE_M  = GK_CU_NVD_TILE_M;
     constexpr int TILE_N  = GK_CU_NVD_TILE_N_OF(WARPS_N);
     constexpr int THREADS = GK_CU_NVD_THREADS_OF(WARPS_N);
@@ -1527,8 +1527,8 @@ void gk_cu_k_mul_mat_mma_nvfp4_deep(gk_tview a, gk_tview_mut d,
     const int warp_m = warp / WARPS_N;
     const int warp_n = warp % WARPS_N;
 
-    const int64_t m0  = (int64_t) blockIdx.x * TILE_M;
-    const int64_t n0  = (int64_t) blockIdx.y * TILE_N;
+    const int64_t m0  = (int64_t) (cols_on_x ? blockIdx.y : blockIdx.x) * TILE_M;
+    const int64_t n0  = (int64_t) (cols_on_x ? blockIdx.x : blockIdx.y) * TILE_N;
     const int64_t i23 = blockIdx.z;
 
     const int64_t i2 = i23 % d.ne[2];
@@ -1849,10 +1849,29 @@ static __host__ __forceinline__ int gk_cu_mma_nvfp4_deep_variant(const struct gk
                     gkFuncAttributeMaxDynamicSharedMemorySize, (int) smem_));      \
             }                                                                      \
         }                                                                          \
+        /* Which operand the concurrently running blocks share. x is the   */      \
+        /* axis the scheduler walks first, so the ~one-block-per-SM set    */      \
+        /* running together differs in x: with rows on x they share one    */      \
+        /* column tile of activations and each column tile streams the     */      \
+        /* whole weight from DRAM again; with columns on x they share a    */      \
+        /* row tile of weights and the activation codes are what is        */      \
+        /* re-read. The codes are the smaller operand whenever the weight  */      \
+        /* is tall, and re-reading them is free once they fit in L2 -      */      \
+        /* 9-11% on the 21504/28672-row projections of a 5376-wide DiT,    */      \
+        /* and a loss (-12%) at k=14336 x 3099 columns, 44 MB of codes.    */      \
+        /* GK_MM_NVFP4_SWAP=0/1 pins it.                                   */      \
+        static const int swap_env_ = gk_cu_env_int("GK_MM_NVFP4_SWAP", -1);        \
+        const int64_t act_bytes_ = n_cols * k_len;                                 \
+        const int64_t wgt_bytes_ = dst->ne[0] * (k_len / 64) * 36;                 \
+        const int swap_ = swap_env_ >= 0 ? (swap_env_ != 0)                        \
+                        : (act_bytes_ <= ((int64_t) 24 << 20) &&                   \
+                           wgt_bytes_ >= 2 * act_bytes_);                          \
+        dim3 dgrid_ = mgrid;                                                       \
+        if (swap_) { dgrid_.x = mgrid.y; dgrid_.y = mgrid.x; }                     \
         gk_cu_k_mul_mat_mma_nvfp4_deep<wn, ks>                                     \
-            <<<mgrid, GK_CU_NVD_THREADS_OF(wn), smem_, stream>>>(                  \
+            <<<dgrid_, GK_CU_NVD_THREADS_OF(wn), smem_, stream>>>(                 \
                 gk_cu_view(src0), gk_cu_view_mut(dst), aq_codes, aq_sc,            \
-                n_grp, r2, r3);                                                    \
+                n_grp, r2, r3, swap_);                                             \
     } while (0)
 
 // Whether the FP4 tensor-core tile can run on the device this stream is on.
@@ -5072,6 +5091,302 @@ void gk_cu_k_mul_mat_mma_k45_pipe(gk_tview a, gk_tview_mut d,
 }
 
 // --------------------------------------------------------------------------
+// The row-scale int8 tile ("mma-i8u").
+//
+// Every integer tile above empties its accumulators to float once per group,
+// because that is where a block format's scale may change, and its own notes
+// call that drain the wall. A weight flagged GK_TENSOR_FLAG_ROW_SCALE has no
+// such place: it is an int8 matrix with one scale per row that happens to be
+// stored as q8_0. Quantize the activation the same way - one scale per column
+// over the whole of k, which is how the models that ship such weights were
+// calibrated to run (ConvRot rotates the activation exactly so that a single
+// scale per row loses nothing) - and the product is an integer GEMM: the
+// tensor core accumulates in s32 across all of k, and the two scales meet the
+// result once, in the epilogue. 14336 products of at most 127*127 stay far
+// inside an int32.
+//
+// A q8_0 block is 34 bytes, so every second block sits two bytes into a word:
+// the stage fetches a round's blocks as one aligned run and the decode
+// funnel-shifts the even ones. (A pipelined cp.async tile at 32 of k a round
+// was tried for plain q8_0 first and measured *slower* than the synchronous
+// one, 13.4 against 14.7 TFLOP/s on Ada - the round was too shallow for the
+// overlap to matter.) The activation codes come from a dense per-column
+// layout. `GK_MM_I8U=0` returns such weights to the q8_0 tile.
+// --------------------------------------------------------------------------
+static __global__ void gk_cu_k_quantize_act_col(gk_tview b, int8_t * codes, float * scales,
+                                                int64_t k_len, int64_t n_cols) {
+    __shared__ float red[GK_CUDA_BLOCK / GK_WARP_SIZE];
+
+    const int64_t ci  = blockIdx.x;
+    const int64_t col = ci % n_cols;
+    const int64_t i23 = ci / n_cols;
+    const int64_t i2  = i23 % b.ne[2];
+    const int64_t i3  = i23 / b.ne[2];
+
+    float amax = 0.0f;
+    for (int64_t k = threadIdx.x; k < k_len; k += blockDim.x) {
+        amax = fmaxf(amax, fabsf(gk_cu_get(b, k, col, i2, i3)));
+    }
+#pragma unroll
+    for (int o = GK_WARP_SIZE / 2; o > 0; o >>= 1) {
+        amax = fmaxf(amax, __shfl_xor_sync(0xffffffffu, amax, o));
+    }
+    if (threadIdx.x % GK_WARP_SIZE == 0) {
+        red[threadIdx.x / GK_WARP_SIZE] = amax;
+    }
+    __syncthreads();
+    amax = 0.0f;
+    for (int w = 0; w < (int) (blockDim.x / GK_WARP_SIZE); ++w) {
+        amax = fmaxf(amax, red[w]);
+    }
+
+    const float inv = amax > 0.0f ? 127.0f / amax : 0.0f;
+    int * dst = (int *) (codes + ci * k_len);
+    for (int64_t w = threadIdx.x; w < k_len / 4; w += blockDim.x) {
+        int packed = 0;
+#pragma unroll
+        for (int e = 0; e < 4; ++e) {
+            const int c = (int) rintf(gk_cu_get(b, w * 4 + e, col, i2, i3) * inv);
+            packed |= (c & 0xff) << (8 * e);
+        }
+        dst[w] = packed;
+    }
+    if (threadIdx.x == 0) {
+        scales[ci] = amax / 127.0f;
+    }
+}
+
+// The tile itself is deep: a round is 256 of k - eight blocks, 272 bytes of a
+// weight row, which is seventeen 16-byte words starting on a 16-byte boundary
+// whenever the row stride is a multiple of 16 (k a multiple of 256) - staged
+// by 16-byte loads that sixteen adjacent lanes aim at one row, then eight
+// k32 mma groups per warp without a barrier between them. At 32 of k a round
+// the same arithmetic spent its time on the two barriers and the stage: the
+// integer accumulators made no difference at all until the round got deep.
+//
+// Two depths: 256 of k a round at 70 KB of shared (one block per
+// multiprocessor on a 100 KB part) and 128 at 37 KB (two). The tile is bound
+// by its stage, not its multiplies, so a second block that computes while the
+// first one loads is worth more than the halved barrier count wherever the
+// part cannot hold two of the deep ones. `GK_MM_I8U_KR` picks by hand.
+template <int KR> struct gk_cu_i8u_geom {
+    static constexpr int    UNITS = KR / 32 * 34 / 8;          // 8-byte words of a weight row a round
+    static constexpr int    LPR   = KR / 8;                    // lanes that share a row
+    static constexpr int    AW    = KR / 32 * 34 / 4 + (KR == 256 ? 0 : 2);  // 68 or 36 words: 4 mod 32
+    static constexpr size_t SMEM  = (size_t) 2 * 128 * AW * sizeof(uint32_t);
+};
+
+template <int KR>
+static __global__ __launch_bounds__(GK_CU_MMAQ_THREADS, KR == 256 ? 1 : 2)
+void gk_cu_k_mul_mat_mma_i8u(gk_tview a, gk_tview_mut d,
+                             const int8_t * codes, const float * scales,
+                             int64_t n_rounds, int64_t r2, int64_t r3) {
+    using G = gk_cu_i8u_geom<KR>;
+    constexpr int TM    = GK_CU_MMAQ_TILE_M;
+    constexpr int TN    = GK_CU_MMAQ_TILE_N;
+    constexpr int AW    = G::AW;
+    constexpr int LPR   = G::LPR;
+    constexpr int RPP   = GK_CU_MMAQ_THREADS / LPR;   // rows a pass covers
+    constexpr int PASS  = TM / RPP;
+
+    static_assert(KR == 128 || KR == 256, "two depths");
+    static_assert(TN == 128 && TM == 128 && GK_CU_MMAQ_THREADS == 256,
+                  "the stage assumes this geometry");
+    static_assert(AW % 32 == 4, "the row stride keeps a warp's fragment loads off each other's banks");
+
+    extern __shared__ __align__(16) uint32_t smem[];
+    uint32_t * As = smem;                 // [TM][AW]: the round's raw weight bytes
+    uint32_t * Bs = smem + TM * AW;       // [TN][AW]: the round's codes
+
+    const int lane  = threadIdx.x % GK_WARP_SIZE;
+    const int warp  = threadIdx.x / GK_WARP_SIZE;
+    const int group = lane / 4;
+    const int tig   = lane % 4;
+
+    const int warp_m = warp / GK_CU_MMAQ_WARPS_N;
+    const int warp_n = warp % GK_CU_MMAQ_WARPS_N;
+
+    // The grid's x is the column (activation) tile: x dispatches fastest, so
+    // the blocks running together share one tile of weight rows, which then
+    // comes out of DRAM once and out of L2 for every other column tile. The
+    // activations are a few megabytes and stay in L2 regardless. With rows on
+    // x every column tile re-read the whole weight matrix from DRAM.
+    const int64_t m0  = (int64_t) blockIdx.y * TM;
+    const int64_t n0  = (int64_t) blockIdx.x * TN;
+    const int64_t i23 = blockIdx.z;
+
+    const int64_t i2 = i23 % d.ne[2];
+    const int64_t i3 = i23 / d.ne[2];
+
+    const int64_t a2 = i2 / r2;
+    const int64_t a3 = i3 / r3;
+
+    const int64_t n_rows = d.ne[0];
+    const int64_t n_cols = d.ne[1];
+    const int64_t k_len  = n_rounds * KR;
+
+    const int8_t * codes23  = codes + i23 * n_cols * k_len;
+    const float *  scales23 = scales + i23 * n_cols;
+
+    // adjacent lanes share a row (or a column), one 8-byte word each
+    const int st_l = (int) threadIdx.x % LPR;
+    const int st_r = (int) threadIdx.x / LPR;
+
+    typedef unsigned long long u64;
+
+    // rows and columns past the edge hold zeros throughout
+#pragma unroll
+    for (int p = 0; p < PASS; ++p) {
+        const int x = st_r + RPP * p;
+        if (m0 + x >= n_rows) {
+            *(u64 *) &As[x * AW + 2 * st_l] = 0ull;
+            if (st_l == LPR - 1) {
+#pragma unroll
+                for (int e = LPR; e < G::UNITS; ++e) {
+                    *(u64 *) &As[x * AW + 2 * e] = 0ull;
+                }
+            }
+        }
+        if (n0 + x >= n_cols) {
+            *(u64 *) &Bs[x * AW + 2 * st_l] = 0ull;
+        }
+    }
+
+    int acc[GK_CU_MMAQ_WMT][GK_CU_MMAQ_WNT][4];
+#pragma unroll
+    for (int wt = 0; wt < GK_CU_MMAQ_WMT; ++wt) {
+#pragma unroll
+        for (int ct = 0; ct < GK_CU_MMAQ_WNT; ++ct) {
+#pragma unroll
+            for (int i = 0; i < 4; ++i) {
+                acc[wt][ct][i] = 0;
+            }
+        }
+    }
+
+    const bool warp_live = m0 + warp_m * GK_CU_MMAQ_WM < n_rows &&
+                           n0 + warp_n * GK_CU_MMAQ_WN < n_cols;
+
+    for (int64_t round = 0; round < n_rounds; ++round) {
+        const int64_t a_off = round * (KR / 32) * 34;
+        const int64_t b_off = round * KR;
+
+#pragma unroll
+        for (int p = 0; p < PASS; ++p) {
+            const int x = st_r + RPP * p;
+            if (m0 + x < n_rows) {
+                const uint8_t * w = (const uint8_t *) gk_cu_row(a, m0 + x, a2, a3) + a_off;
+                *(u64 *) &As[x * AW + 2 * st_l] = *(const u64 *) (w + 8 * st_l);
+                if (st_l == LPR - 1) {
+#pragma unroll
+                    for (int e = LPR; e < G::UNITS; ++e) {
+                        *(u64 *) &As[x * AW + 2 * e] = *(const u64 *) (w + 8 * e);
+                    }
+                }
+            }
+            if (n0 + x < n_cols) {
+                const int8_t * c = codes23 + (n0 + x) * k_len + b_off;
+                *(u64 *) &Bs[x * AW + 2 * st_l] = *(const u64 *) (c + 8 * st_l);
+            }
+        }
+        __syncthreads();
+
+#pragma unroll
+        for (int j = 0; j < KR / 32; ++j) {
+            // a warp whose rows or columns all lie past the edge has nothing
+            // to multiply
+            if (!warp_live) {
+                continue;
+            }
+            // block j of the round starts at byte 34j: its codes sit two bytes
+            // into a word when j is even, on a word when j is odd
+            const int  base = 8 * j + ((j & 1) ? (j + 1) / 2 : j / 2);
+            const bool even = (j & 1) == 0;
+
+            int af[GK_CU_MMAQ_WMT][4];
+#pragma unroll
+            for (int wt = 0; wt < GK_CU_MMAQ_WMT; ++wt) {
+#pragma unroll
+                for (int rh = 0; rh < 2; ++rh) {
+                    const uint32_t * w =
+                        &As[(warp_m * GK_CU_MMAQ_WM + wt * 16 + group + 8 * rh) * AW + base];
+                    if (even) {
+                        af[wt][rh    ] = (int) ((w[tig] >> 16) | (w[tig + 1] << 16));
+                        af[wt][rh + 2] = (int) ((w[4 + tig] >> 16) | (w[5 + tig] << 16));
+                    } else {
+                        af[wt][rh    ] = (int) w[tig];
+                        af[wt][rh + 2] = (int) w[4 + tig];
+                    }
+                }
+            }
+
+#pragma unroll
+            for (int ct = 0; ct < GK_CU_MMAQ_WNT; ++ct) {
+                if (n0 + warp_n * GK_CU_MMAQ_WN + ct * 8 >= n_cols) {
+                    break;   // warp-uniform: the rest of this warp's column tiles are empty
+                }
+                const uint32_t * bw = &Bs[(warp_n * GK_CU_MMAQ_WN + ct * 8 + group) * AW + 8 * j];
+
+                int bf[2];
+                bf[0] = (int) bw[tig];
+                bf[1] = (int) bw[4 + tig];
+
+#pragma unroll
+                for (int wt = 0; wt < GK_CU_MMAQ_WMT; ++wt) {
+                    gk_cu_mma_s8_k32(acc[wt][ct], af[wt], bf);
+                }
+            }
+        }
+        __syncthreads();
+    }
+
+#pragma unroll
+    for (int wt = 0; wt < GK_CU_MMAQ_WMT; ++wt) {
+#pragma unroll
+        for (int i = 0; i < 4; ++i) {
+            const int64_t m = m0 + warp_m * GK_CU_MMAQ_WM + wt * 16 + group + (i >= 2 ? 8 : 0);
+            if (m >= n_rows) {
+                continue;
+            }
+            // the row's scale: the half in front of its first block
+            const float ws = gk_cu_h2f2_w(*(const uint32_t *) gk_cu_row(a, m, a2, a3)).x;
+#pragma unroll
+            for (int ct = 0; ct < GK_CU_MMAQ_WNT; ++ct) {
+                const int64_t n = n0 + warp_n * GK_CU_MMAQ_WN + ct * 8 + tig * 2 + (i & 1);
+                if (n < n_cols) {
+                    gk_cu_set(d, m, n, i2, i3, ws * scales23[n] * (float) acc[wt][ct][i]);
+                }
+            }
+        }
+    }
+}
+
+// the one-time dynamic-shared opt-in, per device
+template <int KR>
+static __host__ bool gk_cu_i8u_ready(const struct gk_cuda_scratch * scratch) {
+    using G = gk_cu_i8u_geom<KR>;
+    if (scratch == NULL || (size_t) scratch->smem_max < G::SMEM) {
+        return false;
+    }
+    if (G::SMEM > 48u * 1024u) {
+        static bool raised[GK_CUDA_MAX_DEVICES] = { false };
+        int dev = 0;
+        if (gkGetDevice(&dev) != gkSuccess || dev < 0 || dev >= GK_CUDA_MAX_DEVICES) {
+            return false;
+        }
+        if (!raised[dev]) {
+            if (gkFuncSetAttribute((const void *) gk_cu_k_mul_mat_mma_i8u<KR>,
+                                   gkFuncAttributeMaxDynamicSharedMemorySize,
+                                   (int) G::SMEM) != gkSuccess) {
+                return false;
+            }
+            raised[dev] = true;
+        }
+    }
+    return true;
+}
+
+// --------------------------------------------------------------------------
 // The q3_K / q6_K pipeline tile.
 //
 // The same pipeline for the two k-quants whose scale changes at element
@@ -6942,6 +7257,52 @@ void gk_cuda_mul_mat(gkStream_t stream, struct gk_cuda_scratch * scratch,
             const int64_t n_cols = dst->ne[1];
             const int64_t n_23   = dst->ne[2] * dst->ne[3];
             const int64_t n_blk  = n_grp * n_cols * n_23;
+
+            // A row-scale int8 weight: the integer GEMM (see the i8u tile).
+            // Its scratch is its own layout, so the activation claim the
+            // other tiles share is dropped rather than left pointing at it.
+            if ((int) src0->type == GK_TYPE_Q8_0 &&
+                (src0->flags & GK_TENSOR_FLAG_ROW_SCALE) != 0 &&
+                gk_cuda_mm_mma_q8_available(scratch) && g_gk_mm_act_dst == NULL &&
+                k_len % 256 == 0 && src0->nb[1] % 8 == 0 &&
+                ((uintptr_t) src0->data & 7u) == 0 &&
+                gk_cu_env_int("GK_MM_I8U", 1) != 0) {
+                // two blocks of the shallow tile where two fit and two of the
+                // deep one do not (Ada: 100 KB a multiprocessor)
+                const int kr_env = gk_cu_env_int("GK_MM_I8U_KR", 0);
+                const bool deep  = kr_env == 256 ||
+                                   (kr_env != 128 &&
+                                    (size_t) scratch->smem_max >= 2 * gk_cu_i8u_geom<256>::SMEM + 8192);
+                const bool ready = deep ? gk_cu_i8u_ready<256>(scratch) : gk_cu_i8u_ready<128>(scratch);
+
+                const size_t code_bytes = (size_t) n_cols * (size_t) n_23 * (size_t) k_len;
+                int8_t * codes = !ready ? NULL : (int8_t *) gk_cu_scratch_get(
+                    scratch, code_bytes + (size_t) n_cols * (size_t) n_23 * sizeof(float), stream);
+                if (codes != NULL) {
+                    float * col_scales = (float *) (codes + code_bytes);
+                    scratch->aq_src    = NULL;
+                    scratch->aq_tensor = NULL;
+
+                    gk_cu_k_quantize_act_col<<<(unsigned) (n_cols * n_23), GK_CUDA_BLOCK, 0, stream>>>(
+                        gk_cu_view(src1), codes, col_scales, k_len, n_cols);
+
+                    dim3 igrid;
+                    igrid.x = (unsigned) ((n_cols     + GK_CU_MMAQ_TILE_N - 1) / GK_CU_MMAQ_TILE_N);
+                    igrid.y = (unsigned) ((dst->ne[0] + GK_CU_MMAQ_TILE_M - 1) / GK_CU_MMAQ_TILE_M);
+                    igrid.z = (unsigned) n_23;
+
+                    if (deep) {
+                        g_gk_mm_path = "mma-i8u-256";
+                        gk_cu_k_mul_mat_mma_i8u<256><<<igrid, GK_CU_MMAQ_THREADS, gk_cu_i8u_geom<256>::SMEM, stream>>>(
+                            gk_cu_view(src0), gk_cu_view_mut(dst), codes, col_scales, k_len / 256, r2, r3);
+                    } else {
+                        g_gk_mm_path = "mma-i8u-128";
+                        gk_cu_k_mul_mat_mma_i8u<128><<<igrid, GK_CU_MMAQ_THREADS, gk_cu_i8u_geom<128>::SMEM, stream>>>(
+                            gk_cu_view(src0), gk_cu_view_mut(dst), codes, col_scales, k_len / 128, r2, r3);
+                    }
+                    return;
+                }
+            }
 
             // Whether the tensor-core tile takes this, decided before the
             // quantize pass because that tile wants the block scalars

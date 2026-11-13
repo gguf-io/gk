@@ -561,6 +561,25 @@ DIT_H3(proj,  5376, 21504)   // the 21504-row projection
 DIT_H3(ffdn, 14336,  5376)   // feed-forward out - the long-k shape
 DIT_H3(ffo,   7168,  5376)   // the 7168-k projection
 
+// MiniMax-H3-Image on the same trunk: 1051 tokens for a 1024^2 text-to-image
+// step, 3099 for an edit with one reference (target + reference latent + the
+// reference's vision tokens). The edit is where the nvfp4 file fell behind the
+// int8 one, so these are the column counts to tune at.
+#define DIT_H3I(name, k, rows, n)                                                        \
+    static struct gk_tensor * b_h3i_##name##_nv (struct gk_ctx * c) {                    \
+        return mul_mat_case(c, GK_TYPE_NVFP4, (k), (rows), (n));                         \
+    }                                                                                    \
+    static struct gk_tensor * b_h3i_##name##_f16(struct gk_ctx * c) {                    \
+        return mul_mat_case(c, GK_TYPE_F16,   (k), (rows), (n));                         \
+    }
+
+DIT_H3I(qkv_e,   5376, 28672, 3099)
+DIT_H3I(proj_e,  5376, 21504, 3099)
+DIT_H3I(ffdn_e, 14336,  5376, 3099)
+DIT_H3I(ffo_e,   7168,  5376, 3099)
+DIT_H3I(qkv_t,   5376, 28672, 1051)
+DIT_H3I(ffdn_t, 14336,  5376, 1051)
+
 // The MiniMax-H3 *video VAE* decoder, which is a second 36-layer transformer
 // and not the convolutional stack the name suggests: hidden 2048, 32 heads of
 // 64, 1797 tokens a tile, and 28 tiles for a 480x480x124 clip. It runs 1008
@@ -1127,6 +1146,16 @@ static const struct bench_case g_cases[] = {
     { NULL,            "ff out    f16",   "7168x5376 n=8742",   b_h3_ffo_f16,  ARENA_HUGE },
     { NULL,            "ff out    q4_K",  "7168x5376 n=8742",   b_h3_ffo_q4k,  ARENA_HUGE },
 
+    { "H3-Image DiT matmuls (edit n=3099, t2i n=1051)",
+                       "qkv  e    nvfp4", "5376x28672 n=3099",  b_h3i_qkv_e_nv,   ARENA_HUGE },
+    { NULL,            "qkv  e    f16",   "5376x28672 n=3099",  b_h3i_qkv_e_f16,  ARENA_HUGE },
+    { NULL,            "proj e    nvfp4", "5376x21504 n=3099",  b_h3i_proj_e_nv,  ARENA_HUGE },
+    { NULL,            "ffdn e    nvfp4", "14336x5376 n=3099",  b_h3i_ffdn_e_nv,  ARENA_HUGE },
+    { NULL,            "ffdn e    f16",   "14336x5376 n=3099",  b_h3i_ffdn_e_f16, ARENA_HUGE },
+    { NULL,            "ffo  e    nvfp4", "7168x5376 n=3099",   b_h3i_ffo_e_nv,   ARENA_HUGE },
+    { NULL,            "qkv  t    nvfp4", "5376x28672 n=1051",  b_h3i_qkv_t_nv,   ARENA_HUGE },
+    { NULL,            "ffdn t    nvfp4", "14336x5376 n=1051",  b_h3i_ffdn_t_nv,  ARENA_HUGE },
+
     { "LTX-2.5 22B DiT at 736^2 x 121 frames (8464 columns)",
                        "attn      q5_K",  "4096x4096 n=8464",   b_ltx_q5k_attn, ARENA_HUGE },
     { NULL,            "ffn up    q5_K",  "4096x16384 n=8464",  b_ltx_q5k_up,   ARENA_HUGE },
@@ -1493,7 +1522,15 @@ int main(int argc, char ** argv) {
         }
 
         const struct run_result g = run_case(bc, gpu, true);
-        const struct run_result c = run_case(bc, cpu, false);
+        // GK_BENCH_NO_CPU=1: device column only, for tuning a kernel at shapes
+        // the CPU takes seconds over
+        struct run_result c;
+        if (getenv("GK_BENCH_NO_CPU") != NULL) {
+            memset(&c, 0, sizeof(c));
+            c.seconds = -1.0;
+        } else {
+            c = run_case(bc, cpu, false);
+        }
 
         char gpu_col[32];
         char ratio_col[32];

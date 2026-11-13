@@ -589,6 +589,7 @@ extern "C" {
         GGML_OP_OPT_STEP_SGD,
 
         GGML_OP_GLU,
+        GGML_OP_ROPE_PE,
 
         GGML_OP_COUNT,
     };
@@ -627,6 +628,7 @@ extern "C" {
         GGML_GLU_OP_SWIGLU_OAI,
         GGML_GLU_OP_GEGLU_ERF,
         GGML_GLU_OP_GEGLU_QUICK,
+        GGML_GLU_OP_SITU,
 
         GGML_GLU_OP_COUNT,
     };
@@ -1356,6 +1358,12 @@ extern "C" {
             struct ggml_tensor  * b);
 
     GGML_API struct ggml_tensor * ggml_geglu_quick_split(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * a,
+            struct ggml_tensor  * b);
+
+    // MOSS-Image's soft-capped gated unit: 4*tanh(a/4)*sigmoid(a) * 25*tanh(b/25)
+    GGML_API struct ggml_tensor * ggml_situ_split(
             struct ggml_context * ctx,
             struct ggml_tensor  * a,
             struct ggml_tensor  * b);
@@ -2340,6 +2348,15 @@ extern "C" {
 
     // Move tensor elements by an offset given for each dimension. Elements that
     // are shifted beyond the last position are wrapped around to the beginning.
+    // rotary embedding from a pair table: a [D, H, L, N], pe [2, 2, D/2, L] ->
+    // [D, L, H, N] in `type` (f32 or f16); see gk_rope_pe
+    GGML_API struct ggml_tensor * ggml_rope_pe(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * a,
+            struct ggml_tensor  * pe,
+            bool                  interleaved,
+            enum ggml_type        type);
+
     GGML_API struct ggml_tensor * ggml_roll(
             struct ggml_context * ctx,
             struct ggml_tensor  * a,

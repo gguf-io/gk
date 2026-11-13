@@ -960,6 +960,12 @@ static bool gk_cu_fuse_out_disjoint(const struct gk_tensor * out,
     return true;
 }
 
+// Why a (mul, add) cluster did not fuse, counted for GK_CUDA_FUSE_DUMP:
+// 0 mul not clean/single-use, 1 no gate row, 2 not flat, 3 shift add shape,
+// 4 shift not a row, 5 madds out aliases, 6 madds window, 7 madd out aliases,
+// 8 madd window, 9 sum has other readers.
+static long g_fuse_why[10] = { 0 };
+
 static void gk_cu_fuse_plan(struct gk_cuda_scratch * scratch,
                             struct gk_cgraph * graph, int n, std::vector<uint8_t> & tag,
                             std::vector<int32_t> & aux) {
@@ -1304,6 +1310,7 @@ static void gk_cu_fuse_plan(struct gk_cuda_scratch * scratch,
 
                 int mi2 = -1;
                 if (!(clean(m, &mi2) && uses[m] == 1 && gk_cu_fuse_same_ne(m, h))) {
+                    g_fuse_why[0]++;
                     continue;
                 }
 
@@ -1312,6 +1319,7 @@ static void gk_cu_fuse_plan(struct gk_cuda_scratch * scratch,
                 const bool g1 = gk_cu_fuse_weight(m->src[1], h->ne[0]) &&
                                 gk_cu_fuse_same_ne(m->src[0], h);
                 if (g0 == g1) {   // none, or ambiguous
+                    g_fuse_why[1]++;
                     continue;
                 }
                 const struct gk_tensor * g = g0 ? m->src[0] : m->src[1];
@@ -1319,11 +1327,16 @@ static void gk_cu_fuse_plan(struct gk_cuda_scratch * scratch,
 
                 if (!(gk_cu_fuse_flat(h) && gk_cu_fuse_flat(y) &&
                       gk_cu_fuse_flat(c) && gk_cu_fuse_same_ne(c, h))) {
+                    g_fuse_why[2]++;
                     continue;
                 }
 
                 // a trailing broadcast shift extends the pair to
                 // x*(1+s)+t in one pass - the modulate spelling
+                if (!(uses[h] == 1 &&
+                      (h->flags & (GK_TENSOR_FLAG_OUTPUT | GK_TENSOR_FLAG_INPUT)) == 0)) {
+                    g_fuse_why[9]++;
+                }
                 if (uses[h] == 1 &&
                     (h->flags & (GK_TENSOR_FLAG_OUTPUT | GK_TENSOR_FLAG_INPUT)) == 0) {
                     for (int j = i + 1; j < n && j <= i + 8; ++j) {
@@ -1334,11 +1347,13 @@ static void gk_cu_fuse_plan(struct gk_cuda_scratch * scratch,
                         if (h2->op != GK_OP_ADD ||
                             tag[(size_t) j] != GK_CU_FUSE_NONE ||
                             !gk_cu_fuse_same_ne(h2, h) || !gk_cu_fuse_flat(h2)) {
+                            g_fuse_why[3]++;
                             break;
                         }
                         const struct gk_tensor * t = h2->src[0] == h ? h2->src[1]
                                                                      : h2->src[0];
                         if (!gk_cu_fuse_weight(t, h->ne[0])) {
+                            g_fuse_why[4]++;
                             break;
                         }
                         if (gk_cu_fuse_pat_on(GK_CU_FUSE_MADDS) &&
@@ -1349,6 +1364,8 @@ static void gk_cu_fuse_plan(struct gk_cuda_scratch * scratch,
                             tag[(size_t) j]   = GK_CU_FUSE_MADDS;
                             aux[(size_t) j * 2]     = mi2;
                             aux[(size_t) j * 2 + 1] = i;
+                        } else {
+                            g_fuse_why[gk_cu_fuse_out_ok(h2, { c, y, g, t }) ? 6 : 5]++;
                         }
                         break;
                     }
@@ -1363,6 +1380,8 @@ static void gk_cu_fuse_plan(struct gk_cuda_scratch * scratch,
                     tag[(size_t) mi2] = GK_CU_FUSE_SKIP;
                     tag[(size_t) i]   = GK_CU_FUSE_MADD;
                     aux[(size_t) i * 2] = mi2;
+                } else {
+                    g_fuse_why[gk_cu_fuse_out_ok(h, { c, y, g }) ? 8 : 7]++;
                 }
                 break;
             }
@@ -1391,6 +1410,11 @@ static void gk_cu_fuse_plan(struct gk_cuda_scratch * scratch,
                     cnt[GK_CU_FUSE_MADD], cnt[GK_CU_FUSE_MADDS],
                     cnt[GK_CU_FUSE_UNARYMUL], cnt[GK_CU_FUSE_ROPE2],
                     cnt[GK_CU_FUSE_MMACT], cnt[GK_CU_FUSE_SKIP]);
+            gk_logf("gk cuda fuse madd rejects so far: mul %ld gate %ld flat %ld shift-shape %ld "
+                    "shift-row %ld madds-alias %ld madds-window %ld madd-alias %ld madd-window %ld "
+                    "sum-shared %ld\n",
+                    g_fuse_why[0], g_fuse_why[1], g_fuse_why[2], g_fuse_why[3], g_fuse_why[4],
+                    g_fuse_why[5], g_fuse_why[6], g_fuse_why[7], g_fuse_why[8], g_fuse_why[9]);
         }
     }
 }

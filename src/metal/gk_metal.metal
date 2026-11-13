@@ -643,6 +643,7 @@ kernel void gk_mtl_glu(device const uchar * a [[buffer(0)]],
         case 2:  r = gk_mtl_silu(act) * mul;          break;
         case 4:  r = gk_mtl_gelu_erf(act) * mul;      break;
         case 5:  r = gk_mtl_gelu_quick(act) * mul;    break;
+        case 6:  r = 4.0f * precise::tanh(0.25f * act) / (1.0f + exp(-act)) * (25.0f * precise::tanh(mul * (1.0f / 25.0f))); break; // situ
         default: {
             // the gpt-oss variant: clamped operands, a sigmoid with a
             // temperature, +1 on the gate

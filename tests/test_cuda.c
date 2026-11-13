@@ -323,6 +323,38 @@ static struct gk_tensor * build_pool_2d_max(struct gk_ctx * ctx, struct gk_tenso
     return gk_pool_2d(ctx, in[0], GK_OP_POOL_MAX, 3, 3, 2, 2, 1.0f, 1.0f);
 }
 
+// MOSS-Image's situ: the two row-strided halves of one up/gate projection
+// through the fused soft-capped gate, exactly how the DiT block calls it.
+static struct gk_tensor * build_glu_situ(struct gk_ctx * ctx, struct gk_tensor ** in, int * n_in) {
+    const int64_t half = 96, rows = 7;
+    in[0] = gk_new_tensor_2d(ctx, GK_TYPE_F32, 2 * half, rows);
+    *n_in = 1;
+    struct gk_tensor * hidden = gk_view_2d(ctx, in[0], half, rows, in[0]->nb[1], 0);
+    struct gk_tensor * gate   = gk_view_2d(ctx, in[0], half, rows, in[0]->nb[1], (size_t) half * sizeof(float));
+    return gk_glu_split(ctx, gate, hidden, GK_GLU_OP_SITU);
+}
+
+// The pair-table rope both ways round, from a head-split projection with the
+// strides the engine hands it (a view two heads into a wider row).
+static struct gk_tensor * build_rope_pe_split(struct gk_ctx * ctx, struct gk_tensor ** in, int * n_in) {
+    const int64_t D = 32, H = 3, L = 5, N = 2;
+    in[0] = gk_new_tensor_4d(ctx, GK_TYPE_F32, D * (H + 2), L, N, 1);
+    in[1] = gk_new_tensor_4d(ctx, GK_TYPE_F32, 2, 2, D / 2, L);
+    *n_in = 2;
+    struct gk_tensor * x = gk_view_4d(ctx, in[0], D, H, L, N,
+                                      (size_t) D * sizeof(float), in[0]->nb[1], in[0]->nb[2],
+                                      (size_t) 2 * D * sizeof(float));
+    return gk_rope_pe(ctx, x, in[1], false, GK_TYPE_F32);
+}
+
+static struct gk_tensor * build_rope_pe_interleaved(struct gk_ctx * ctx, struct gk_tensor ** in, int * n_in) {
+    const int64_t D = 32, H = 3, L = 5, N = 2;
+    in[0] = gk_new_tensor_4d(ctx, GK_TYPE_F32, D, H, L, N);
+    in[1] = gk_new_tensor_4d(ctx, GK_TYPE_F32, 2, 2, D / 2, L);
+    *n_in = 2;
+    return gk_rope_pe(ctx, in[0], in[1], true, GK_TYPE_F16);
+}
+
 static struct gk_tensor * build_pool_2d_avg(struct gk_ctx * ctx, struct gk_tensor ** in, int * n_in) {
     in[0] = gk_new_tensor_3d(ctx, GK_TYPE_F32, 16, 16, 4);
     *n_in = 1;
@@ -2773,6 +2805,9 @@ int main(void) {
     failures += run_op(gpu, "ssm_conv",      build_ssm_conv);
     failures += run_op(gpu, "pool_2d max",   build_pool_2d_max);
     failures += run_op(gpu, "pool_2d avg",   build_pool_2d_avg);
+    failures += run_op(gpu, "glu situ",      build_glu_situ);
+    failures += run_op(gpu, "rope_pe split", build_rope_pe_split);
+    failures += run_op_tol(gpu, "rope_pe il f16", build_rope_pe_interleaved, 5e-3f);
     failures += run_op(gpu, "conv_2d",       build_conv_2d);
     failures += run_op(gpu, "conv_2d f16",   build_conv_2d_f16);
     failures += run_op(gpu, "convT_1d s3",   build_conv_transpose_1d);

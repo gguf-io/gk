@@ -111,6 +111,7 @@ GGML_COMPAT_STATIC_ASSERT((int) GGML_OP_COUNT == (int) GK_OP_COUNT &&
                           (int) GGML_OP_MUL_MAT == (int) GK_OP_MUL_MAT &&
                           (int) GGML_OP_FLASH_ATTN_EXT == (int) GK_OP_FLASH_ATTN_EXT &&
                           (int) GGML_OP_GLU == (int) GK_OP_GLU &&
+                          (int) GGML_OP_ROPE_PE == (int) GK_OP_ROPE_PE &&
                           (int) GGML_OP_DSV4_HC_POST == (int) GK_OP_DSV4_HC_POST,
                           "op enums must agree");
 GGML_COMPAT_STATIC_ASSERT((int) GGML_UNARY_OP_COUNT == (int) GK_UNARY_OP_COUNT &&

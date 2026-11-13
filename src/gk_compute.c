@@ -500,6 +500,11 @@ static void gk_compute_glu(struct gk_compute_state * st, struct gk_tensor * dst)
                         case GK_GLU_OP_SWIGLU:      out[i] = gk_act_silu(x) * m;        break;
                         case GK_GLU_OP_GEGLU_ERF:   out[i] = gk_act_gelu_erf(x) * m;    break;
                         case GK_GLU_OP_GEGLU_QUICK: out[i] = gk_act_gelu_quick(x) * m;  break;
+                        case GK_GLU_OP_SITU:
+                            // soft caps on both sides, a silu-shaped gate: the
+                            // spelled-out graph is eight elementwise passes
+                            out[i] = 4.0f * tanhf(0.25f * x) / (1.0f + expf(-x)) * (25.0f * tanhf(m * (1.0f / 25.0f)));
+                            break;
                         default:
                             GK_ABORT("glu op %s is not implemented", gk_glu_op_name(op));
                     }
@@ -2248,6 +2253,46 @@ static void gk_compute_roll(struct gk_compute_state * st, struct gk_tensor * dst
         const int64_t s = gk_wrap_index(-s0, n);
         memcpy(dst_row, src_row + s, (size_t) (n - s) * sizeof(float));
         memcpy(dst_row + (n - s), src_row, (size_t) s * sizeof(float));
+    }
+}
+
+// Rotary embedding from a pair table: see gk_rope_pe. One output row (a
+// position of one head) is one input row read through the head/position
+// swap, so the layout change costs nothing beyond the arithmetic.
+static void gk_compute_rope_pe(struct gk_compute_state * st, struct gk_tensor * dst) {
+    const struct gk_tensor * src0 = dst->src[0]; // [D, H, L, N]
+    const struct gk_tensor * src1 = dst->src[1]; // [2, 2, D/2, L]
+
+    GK_ASSERT(src0->type == GK_TYPE_F32 && src1->type == GK_TYPE_F32);
+
+    const bool    interleaved = gk_get_op_params_i32(dst, 0) != 0;
+    const int64_t half        = dst->ne[0] / 2;
+
+    float * xbuf = gk_scratch(st, 0);
+    float * out  = gk_scratch(st, 1);
+
+    int64_t ir0, ir1;
+    gk_rows_for_thread(dst, st->ith, st->nth, &ir0, &ir1);
+
+    for (int64_t ir = ir0; ir < ir1; ++ir) {
+        const int64_t l = ir % dst->ne[1];
+        const int64_t h = (ir / dst->ne[1]) % dst->ne[2];
+        const int64_t n = ir / (dst->ne[1] * dst->ne[2]);
+
+        const float * x = gk_row_read(src0, h, l, n, xbuf);
+        const float * p = (const float *) ((const char *) src1->data + l * src1->nb[3]);
+
+        for (int64_t k = 0; k < half; ++k) {
+            const int64_t da = interleaved ? 2 * k     : k;
+            const int64_t db = interleaved ? 2 * k + 1 : k + half;
+            const float   xa = x[da];
+            const float   xb = x[db];
+            const float * pk = p + 4 * k; // [j + 2 i]: i picks the output of the pair, j the input
+            out[da] = xa * pk[0] + xb * pk[1];
+            out[db] = xa * pk[2] + xb * pk[3];
+        }
+
+        gk_row_write(dst, l, h, n, out);
     }
 }
 
@@ -4011,6 +4056,7 @@ static void gk_compute_node(struct gk_compute_state * st, struct gk_tensor * nod
         case GK_OP_FILL:     gk_compute_fill    (st, node); break;
         case GK_OP_ARANGE:   gk_compute_arange  (st, node); break;
         case GK_OP_ROLL:     gk_compute_roll    (st, node); break;
+        case GK_OP_ROPE_PE:  gk_compute_rope_pe (st, node); break;
 
         case GK_OP_TIMESTEP_EMBEDDING: gk_compute_timestep_embedding(st, node); break;
 
@@ -4139,6 +4185,7 @@ bool gk_cpu_has_kernel(enum gk_op op) {
         case GK_OP_DSV4_HC_COMB:
         case GK_OP_DSV4_HC_PRE:
         case GK_OP_DSV4_HC_POST:
+        case GK_OP_ROPE_PE:
         case GK_OP_MAP_CUSTOM1:
         case GK_OP_MAP_CUSTOM2:
         case GK_OP_MAP_CUSTOM3:

@@ -1247,6 +1247,27 @@ struct gk_tensor * gk_arange(struct gk_ctx * ctx, float start, float stop, float
     return result;
 }
 
+struct gk_tensor * gk_rope_pe(struct gk_ctx * ctx, struct gk_tensor * a, struct gk_tensor * pe,
+                              bool interleaved, enum gk_type type) {
+    GK_ASSERT(a->type == GK_TYPE_F32 && a->nb[0] == gk_type_size(a->type));
+    GK_ASSERT(a->ne[0] % 2 == 0);
+    GK_ASSERT(pe->type == GK_TYPE_F32 && gk_is_contiguous(pe));
+    GK_ASSERT(pe->ne[0] == 2 && pe->ne[1] == 2 && pe->ne[2] == a->ne[0] / 2 && pe->ne[3] == a->ne[2]);
+    GK_ASSERT(type == GK_TYPE_F32 || type == GK_TYPE_F16);
+
+    // [D, H, L, N] in, [D, L, H, N] out
+    const int64_t ne[GK_MAX_DIMS] = { a->ne[0], a->ne[2], a->ne[1], a->ne[3] };
+    struct gk_tensor * result = gk_new_tensor(ctx, type, GK_MAX_DIMS, ne);
+
+    gk_set_op_params_i32(result, 0, interleaved ? 1 : 0);
+
+    result->op     = GK_OP_ROPE_PE;
+    result->src[0] = a;
+    result->src[1] = pe;
+
+    return result;
+}
+
 struct gk_tensor * gk_roll(struct gk_ctx * ctx, struct gk_tensor * a,
                            int shift0, int shift1, int shift2, int shift3) {
     GK_ASSERT(a->nb[0] == gk_type_size(a->type));

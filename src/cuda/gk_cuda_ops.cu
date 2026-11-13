@@ -665,6 +665,9 @@ static __global__ void gk_cu_k_glu(gk_tview a, gk_tview b, bool has_b, gk_tview_
             case GK_GLU_OP_SWIGLU:      r = gk_cu_silu(act) * mul;           break;
             case GK_GLU_OP_GEGLU_ERF:   r = gk_cu_gelu_erf(act) * mul;       break;
             case GK_GLU_OP_GEGLU_QUICK: r = gk_cu_gelu_quick(act) * mul;     break;
+            case GK_GLU_OP_SITU:
+                r = 4.0f * tanhf(0.25f * act) / (1.0f + expf(-act)) * (25.0f * tanhf(mul * (1.0f / 25.0f)));
+                break;
             default: {
                 // the gpt-oss variant: both operands clamped, a sigmoid with a
                 // temperature, and +1 on the gate
@@ -2810,6 +2813,35 @@ static __global__ void gk_cu_k_roll(gk_tview a, gk_tview_mut d,
     }
 }
 
+// Rotary embedding from a pair table (gk_rope_pe): the input is [D, H, L, N],
+// the output [D, L, H, N]; each output element reads its pair partner too,
+// which the cache serves from the same row.
+static __global__ void gk_cu_k_rope_pe(gk_tview a, const float * __restrict__ pe, gk_tview_mut d,
+                                       int interleaved, int64_t n) {
+    const int64_t half = d.ne[0] / 2;
+
+    GK_CU_FLAT_LOOP(n) {
+        const gk_cu_idx x = gk_cu_decompose(k, d.ne); // i0 = d, i1 = l, i2 = h, i3 = n
+
+        int64_t kk, i;
+        if (interleaved) {
+            kk = x.i0 >> 1;
+            i  = x.i0 & 1;
+        } else {
+            kk = x.i0 % half;
+            i  = x.i0 / half;
+        }
+        const int64_t da = interleaved ? 2 * kk     : kk;
+        const int64_t db = interleaved ? 2 * kk + 1 : kk + half;
+
+        const float xa = gk_cu_get(a, da, x.i2, x.i1, x.i3);
+        const float xb = gk_cu_get(a, db, x.i2, x.i1, x.i3);
+        const float * p = pe + 4 * (kk + half * x.i1) + 2 * i;
+
+        gk_cu_set(d, x.i0, x.i1, x.i2, x.i3, xa * p[0] + xb * p[1]);
+    }
+}
+
 // The state-space convolution: a short depthwise filter slid along the time
 // axis of a padded input. `sx` is [d_conv-1+n_t, d_inner, n_seq] and the
 // destination is [d_inner, n_t, n_seq] - the inner dimension moves to the
@@ -3726,6 +3758,7 @@ bool gk_cuda_supports_op(const struct gk_tensor * op) {
         case GK_OP_FLASH_ATTN_EXT: case GK_OP_IM2COL: case GK_OP_UPSCALE:
         case GK_OP_SET_ROWS:
         case GK_OP_ROLL: case GK_OP_SSM_CONV: case GK_OP_POOL_2D:
+        case GK_OP_ROPE_PE:
         case GK_OP_CONV_2D: case GK_OP_SSM_SCAN:
         case GK_OP_CONV_2D_DW: case GK_OP_CONV_TRANSPOSE_1D:
         case GK_OP_RWKV_WKV6: case GK_OP_RWKV_WKV7: case GK_OP_GATED_DELTA_NET:
@@ -4515,6 +4548,12 @@ bool gk_cuda_compute_op(gkStream_t stream, struct gk_cuda_scratch * scratch,
                 gk_cu_view(src0), gk_cu_view_mut(node),
                 gk_get_op_params_i32(node, 0), gk_get_op_params_i32(node, 1),
                 gk_get_op_params_i32(node, 2), gk_get_op_params_i32(node, 3), ne);
+            return true;
+
+        case GK_OP_ROPE_PE:
+            gk_cu_k_rope_pe<<<nb, GK_CUDA_BLOCK, 0, stream>>>(
+                gk_cu_view(src0), (const float *) src1->data, gk_cu_view_mut(node),
+                gk_get_op_params_i32(node, 0), ne);
             return true;
 
         case GK_OP_SSM_CONV:

@@ -45,6 +45,7 @@ void main() {
         case 2:  r = gk_silu(act) * mul;       break;
         case 4:  r = gk_gelu_erf(act) * mul;   break;
         case 5:  r = gk_gelu_quick(act) * mul; break;
+        case 6:  r = 4.0 * tanh(0.25 * act) / (1.0 + exp(-act)) * (25.0 * tanh(mul * (1.0 / 25.0))); break; // situ
         default: {
             const float alpha = P.f01[0];
             const float limit = P.f01[1];

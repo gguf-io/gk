@@ -119,6 +119,7 @@ static const char * const g_op_name[GK_OP_COUNT] = {
     [GK_OP_CROSS_ENTROPY_LOSS_BACK] = "cross_entropy_loss_back",
     [GK_OP_OPT_STEP_ADAMW]      = "opt_step_adamw",
     [GK_OP_OPT_STEP_SGD]        = "opt_step_sgd",
+    [GK_OP_ROPE_PE]             = "rope_pe",
 };
 
 // Infix/prefix forms used when a graph is printed as an expression.
@@ -189,6 +190,7 @@ static const char * const g_glu_op_name[GK_GLU_OP_COUNT] = {
     [GK_GLU_OP_SWIGLU_OAI]  = "swiglu_oai",
     [GK_GLU_OP_GEGLU_ERF]   = "geglu_erf",
     [GK_GLU_OP_GEGLU_QUICK] = "geglu_quick",
+    [GK_GLU_OP_SITU]        = "situ",
 };
 
 static const char * gk_lookup(const char * const * table, int n, int i) {
