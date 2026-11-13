@@ -156,7 +156,8 @@ if (GK_CUDA)
     include(${CMAKE_CURRENT_SOURCE_DIR}/cmake/gk_cuda_arch.cmake)
 
     if (GK_CUDA_ARCHITECTURES)
-        set(GK_CUDA_ARCH_VALUE "${GK_CUDA_ARCHITECTURES}")
+        # plain numbers are shaped like a detected list (SASS each, PTX once)
+        gk_shape_cuda_architectures("${GK_CUDA_ARCHITECTURES}" GK_CUDA_ARCH_VALUE)
     elseif (DEFINED CMAKE_CUDA_ARCHITECTURES)
         # An explicit CMAKE_CUDA_ARCHITECTURES is somebody's decision; leave it.
         set(GK_CUDA_ARCH_VALUE "${CMAKE_CUDA_ARCHITECTURES}")
