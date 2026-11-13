@@ -30,6 +30,7 @@
 
 #include <stdlib.h>
 #include <string.h>
+#include <pthread.h>
 
 #define GK_METAL_MAX_DEVICES 8
 #define GK_METAL_MAX_BUFFERS 256
@@ -37,6 +38,13 @@
 // Metal's own minimum for a bound buffer offset on discrete parts, and a
 // harmless over-alignment on the unified ones.
 #define GK_METAL_ALIGN 256
+
+// Synthetic address space for private buffers: gk hands out pointers and
+// resolves them back to a buffer, so a private buffer still needs a unique
+// range to key on. Nothing ever reads or writes through these.
+#define GK_METAL_SYNTH_BASE   ((uint64_t) 0x100000000000ull)
+#define GK_METAL_SYNTH_STRIDE ((uint64_t) 0x10000000000ull)
+#define GK_METAL_SCRATCH      ((size_t) 32 * 1024 * 1024)
 
 // Threads per group for the row-wise kernels. 256 is a whole number of SIMD
 // groups on every Apple GPU, which the two-stage reductions assume.
@@ -137,6 +145,18 @@ struct gk_metal_device_ctx {
 
     size_t total_memory;
 
+    // A private buffer has no host address, but gk hands out pointers and
+    // resolves them back to its buffer, so each one still gets a unique range
+    // in a synthetic address space. These are keys, never dereferenced.
+    unsigned long long           synth;
+
+    // Staging buffer for transfers in and out of private buffers.
+    id<MTLBuffer>                scratch;
+    size_t                       scratch_size;
+
+    // The backend's command queue, kept here so buffer transfers can reach it.
+    id<MTLCommandQueue>          queue;
+
     // Storage mode, decided once at discovery. Private only when the device has
     // no unified memory; GK_METAL_STORAGE overrides for a manual check.
     bool                         storage_private;
@@ -160,6 +180,7 @@ struct gk_metal_buffer_ctx {
     id<MTLBuffer>                mtl;
     void *                       base;
     size_t                       size;
+    bool                         shared;  // base is a real host address
 };
 
 // --------------------------------------------------------------------------
@@ -220,28 +241,145 @@ static void * gk_metal_buffer_get_base(gk_backend_buffer_t buffer) {
     return ((struct gk_metal_buffer_ctx *) buffer->context)->base;
 }
 
+// A private buffer has no host address, so a transfer goes through a blit via
+// a shared staging buffer. A shared buffer keeps the direct memcpy.
+static id<MTLBuffer> gk_metal_scratch(struct gk_metal_device_ctx * dev) {
+    if (dev->scratch == nil) {
+        dev->scratch      = [dev->mtl newBufferWithLength:GK_METAL_SCRATCH
+                                                 options:MTLResourceStorageModeShared];
+        dev->scratch_size = GK_METAL_SCRATCH;
+    }
+    return dev->scratch;
+}
+
+// The staging buffer is one per device, and the weight loader writes tensors
+// from several threads at once. Without this lock two threads interleave their
+// memcpy into the scratch with the blit that follows it, and the weights that
+// reach the GPU are a mixture of two tensors. Recursive, because a fill holds
+// it while it drives the transfer in chunks.
+static pthread_once_t     g_mtl_xfer_once = PTHREAD_ONCE_INIT;
+static pthread_mutex_t    g_mtl_xfer_lock;
+
+static void gk_metal_xfer_lock_init(void) {
+    pthread_mutexattr_t attr;
+    pthread_mutexattr_init(&attr);
+    pthread_mutexattr_settype(&attr, PTHREAD_MUTEX_RECURSIVE);
+    pthread_mutex_init(&g_mtl_xfer_lock, &attr);
+    pthread_mutexattr_destroy(&attr);
+}
+
+static void gk_metal_xfer_enter(void) {
+    pthread_once(&g_mtl_xfer_once, gk_metal_xfer_lock_init);
+    pthread_mutex_lock(&g_mtl_xfer_lock);
+}
+
+static void gk_metal_xfer_leave(void) {
+    pthread_mutex_unlock(&g_mtl_xfer_lock);
+}
+
+static void gk_metal_transfer_in(struct gk_metal_buffer_ctx * ctx, size_t dst_offset,
+                                 const void * src, size_t size) {
+    if (dst_offset + size > ctx->size) {
+        gk_logf("gk Metal: transfer past end of buffer: offset %zu + %zu > %zu\n",
+                dst_offset, size, ctx->size);
+        return;
+    }
+    gk_metal_xfer_enter();
+    id<MTLBuffer> scratch = gk_metal_scratch(ctx->dev);
+    size_t done = 0;
+    while (done < size) {
+        const size_t n = (size - done) > GK_METAL_SCRATCH ? GK_METAL_SCRATCH : (size - done);
+        memcpy((void *) [scratch contents], (const char *) src + done, n);
+
+        id<MTLCommandBuffer> cmd = [ctx->dev->queue commandBuffer];
+        id<MTLBlitCommandEncoder> enc = [cmd blitCommandEncoder];
+        [enc copyFromBuffer:scratch sourceOffset:0
+                toBuffer:ctx->mtl destinationOffset:dst_offset + done size:n];
+        [enc endEncoding];
+        [cmd commit];
+        [cmd waitUntilCompleted];
+        done += n;
+    }
+    gk_metal_xfer_leave();
+}
+
+static void gk_metal_transfer_out(struct gk_metal_buffer_ctx * ctx, size_t src_offset,
+                                  void * dst, size_t size) {
+    gk_metal_xfer_enter();
+    id<MTLBuffer> scratch = gk_metal_scratch(ctx->dev);
+    size_t done = 0;
+    while (done < size) {
+        const size_t n = (size - done) > GK_METAL_SCRATCH ? GK_METAL_SCRATCH : (size - done);
+        id<MTLCommandBuffer> cmd = [ctx->dev->queue commandBuffer];
+        id<MTLBlitCommandEncoder> enc = [cmd blitCommandEncoder];
+        [enc copyFromBuffer:ctx->mtl sourceOffset:src_offset + done
+                toBuffer:scratch destinationOffset:0 size:n];
+        [enc endEncoding];
+        [cmd commit];
+        [cmd waitUntilCompleted];
+        memcpy((char *) dst + done, (const void *) [scratch contents], n);
+        done += n;
+    }
+    gk_metal_xfer_leave();
+}
+
+// A fill goes through staging like any other private-buffer write, so it needs
+// no separate path and no alignment constraint.
+static void gk_metal_fill(struct gk_metal_buffer_ctx * ctx, size_t offset, size_t size,
+                          uint8_t value) {
+    if (ctx->shared) {
+        memset((char *) ctx->base + offset, value, size);
+        return;
+    }
+    uint8_t * pattern = (uint8_t *) malloc(GK_METAL_SCRATCH);
+    if (pattern == NULL) {
+        return;
+    }
+    memset(pattern, value, GK_METAL_SCRATCH);
+    size_t done = 0;
+    while (done < size) {
+        const size_t n = (size - done) > GK_METAL_SCRATCH ? GK_METAL_SCRATCH : (size - done);
+        gk_metal_transfer_in(ctx, offset + done, pattern, n);
+        done += n;
+    }
+    free(pattern);
+}
 static void gk_metal_buffer_set_tensor(gk_backend_buffer_t buffer, struct gk_tensor * tensor,
                                        const void * data, size_t offset, size_t size) {
-    GK_UNUSED(buffer);
-    // Shared storage: the GPU sees these bytes without a transfer.
-    memcpy((char *) tensor->data + offset, data, size);
+    struct gk_metal_buffer_ctx * ctx = (struct gk_metal_buffer_ctx *) buffer->context;
+    if (ctx->shared) {
+        memcpy((char *) tensor->data + offset, data, size);
+        return;
+    }
+    const size_t base = (size_t) ((const char *) tensor->data - (const char *) ctx->base);
+    gk_metal_transfer_in(ctx, base + offset, data, size);
 }
 
 static void gk_metal_buffer_get_tensor(gk_backend_buffer_t buffer, const struct gk_tensor * tensor,
                                        void * data, size_t offset, size_t size) {
-    GK_UNUSED(buffer);
-    memcpy(data, (const char *) tensor->data + offset, size);
+    struct gk_metal_buffer_ctx * ctx = (struct gk_metal_buffer_ctx *) buffer->context;
+    if (ctx->shared) {
+        memcpy(data, (const char *) tensor->data + offset, size);
+        return;
+    }
+    const size_t base = (size_t) ((const char *) tensor->data - (const char *) ctx->base);
+    gk_metal_transfer_out(ctx, base + offset, data, size);
 }
 
 static void gk_metal_buffer_clear(gk_backend_buffer_t buffer, uint8_t value) {
     struct gk_metal_buffer_ctx * ctx = (struct gk_metal_buffer_ctx *) buffer->context;
-    memset(ctx->base, value, ctx->size);
+    gk_metal_fill(ctx, 0, ctx->size, value);
 }
 
 static void gk_metal_buffer_memset_tensor(gk_backend_buffer_t buffer, struct gk_tensor * tensor,
                                           uint8_t value, size_t offset, size_t size) {
-    GK_UNUSED(buffer);
-    memset((char *) tensor->data + offset, value, size);
+    struct gk_metal_buffer_ctx * ctx = (struct gk_metal_buffer_ctx *) buffer->context;
+    if (ctx->shared) {
+        memset((char *) tensor->data + offset, value, size);
+        return;
+    }
+    const size_t base = (size_t) ((const char *) tensor->data - (const char *) ctx->base);
+    gk_metal_fill(ctx, base + offset, size, value);
 }
 
 static const struct gk_backend_buffer_i g_metal_buffer_iface = {
@@ -268,8 +406,9 @@ static gk_backend_buffer_t gk_metal_buft_alloc(gk_backend_buffer_type_t buft, si
         return NULL;
     }
 
-    ctx->dev  = dev;
-    ctx->size = size;
+    ctx->dev    = dev;
+    ctx->size   = size;
+    ctx->shared = true;   // until a discrete device opts into private storage
     ctx->mtl  = [dev->mtl newBufferWithLength:size options:MTLResourceStorageModeShared];
 
     if (ctx->mtl == nil) {
@@ -924,6 +1063,7 @@ static gk_backend_t gk_metal_device_init_backend(gk_device_t dev) {
 
     ctx->dev   = d;
     ctx->queue = [d->mtl newCommandQueue];
+    d->queue   = ctx->queue;
 
     if (ctx->queue == nil) {
         gk_logf("gk Metal: could not create a command queue on %s\n", d->name);
