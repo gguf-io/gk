@@ -115,6 +115,45 @@ function(_gk_cmake_native_architectures out_var)
     set(${out_var} "${archs}" PARENT_SCOPE)
 endfunction()
 
+# Shapes a list of plain compute capabilities ("89;120") the way a detected
+# list is shaped: SASS only for each (`-real`, Blackwell consumer parts on their
+# `a` target, see below), PTX once, for the newest. Handed to CMake as it is, a
+# bare list asks for SASS *and* PTX for every entry and plain `sm_120`: a third
+# more device code in the binary (25 MB in a ggk wheel for two architectures)
+# and none of the FP4 tensor-core kernels. A list that already says
+# -real/-virtual or names an `a` target is somebody's decision and passes
+# through untouched.
+function(gk_shape_cuda_architectures archs out_var)
+    set(plain TRUE)
+    foreach (arch IN LISTS archs)
+        if (NOT arch MATCHES "^[0-9]+$")
+            set(plain FALSE)
+        endif()
+    endforeach()
+    if (NOT plain OR CMAKE_VERSION VERSION_LESS 3.18)
+        set(${out_var} "${archs}" PARENT_SCOPE)
+        return()
+    endif()
+    set(newest 0)
+    set(result "")
+    foreach (arch IN LISTS archs)
+        if (arch GREATER newest)
+            set(newest ${arch})
+        endif()
+        if (arch MATCHES "^12[0-9]$")
+            list(APPEND result ${arch}a-real)
+        else()
+            list(APPEND result ${arch}-real)
+        endif()
+    endforeach()
+    list(APPEND result ${newest}-virtual)
+    string(REPLACE ";" ", " archs_text "${archs}")
+    string(REPLACE ";" ", " result_text "${result}")
+    message(STATUS "gk: CUDA architectures ${archs_text} (GK_CUDA_ARCHITECTURES), with PTX for ${newest}")
+    message(STATUS "gk: CUDA_ARCHITECTURES = ${result_text}")
+    set(${out_var} "${result}" PARENT_SCOPE)
+endfunction()
+
 # Picks the architecture list for a build that was not given one.
 #
 # The result is in CUDA_ARCHITECTURES form: `<n>-real` for each architecture
