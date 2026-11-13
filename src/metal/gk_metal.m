@@ -137,6 +137,10 @@ struct gk_metal_device_ctx {
 
     size_t total_memory;
 
+    // Storage mode, decided once at discovery. Private only when the device has
+    // no unified memory; GK_METAL_STORAGE overrides for a manual check.
+    bool                         storage_private;
+
     // Every live buffer on this device, so a tensor's address can be resolved
     // back to the buffer holding it. Nothing else needs the list, and it is
     // short - a model is a handful of large buffers, not many small ones.
@@ -1042,6 +1046,19 @@ void gk_metal_register_devices(void) {
 
         d->index = 0;
         d->mtl   = mtl;
+
+        d->storage_private = ![mtl hasUnifiedMemory];
+        const char * e = getenv("GK_METAL_STORAGE");
+        if (e != NULL) {
+            if (strcmp(e, "shared") == 0) {
+                d->storage_private = false;
+            } else if (strcmp(e, "private") == 0) {
+                d->storage_private = true;
+            }
+        }
+        gk_logf("gk Metal: %s, unified memory %s -> %s storage\n",
+                [[mtl name] UTF8String], [mtl hasUnifiedMemory] ? "yes" : "no",
+                d->storage_private ? "private" : "shared");
 
         // The working-set limit is what the driver will actually let a process
         // hold, which is the number a placement decision should be made
