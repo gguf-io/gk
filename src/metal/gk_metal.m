@@ -1,19 +1,19 @@
 // The Metal backend: devices, memory, and running a graph on an Apple GPU.
 //
-// Two things make this different from the CUDA backend next door, and both
-// come from the same fact - on every Mac gk runs on, the GPU and the CPU share
-// physical memory.
+// Storage follows the device. A unified-memory Mac uses shared buffers, which
+// have a host address: `tensor->data` is then a real pointer and getting a
+// tensor out is a memcpy rather than a transfer. A discrete GPU - an eGPU in
+// particular - uses private buffers, because shared storage would put every
+// buffer in host RAM and make the GPU read it across the PCIe link (0.9 GB/s
+// against 32.5 GB/s measured on an RX 580 eGPU). Private buffers have no host
+// address, so they carry a synthetic one: gk hands out pointers and resolves
+// them back to a buffer, and the transfers go through a blit instead of a
+// memcpy. Nothing dereferences a synthetic address. The choice is made once
+// per device at discovery and can be forced with GK_METAL_STORAGE=shared|private.
 //
-//   * A buffer is allocated with shared storage, so its contents have a host
-//     address. `tensor->data` is therefore a real pointer and getting a tensor
-//     out is a memcpy rather than a transfer. The buffer type still reports
-//     itself as device memory: the scheduler uses that answer to decide where
-//     a node runs, and "the GPU's memory" is the right answer for placement
-//     even when the pages happen to be reachable from both sides.
-//
-//   * Kernels are bound buffers, not pointers, so a tensor's address has to be
-//     resolved back to the buffer that contains it. Every live buffer is
-//     registered with its device for exactly that lookup.
+// Kernels are bound buffers, not pointers, so a tensor's address has to be
+// resolved back to the buffer that contains it. Every live buffer is
+// registered with its device for exactly that lookup.
 //
 // The kernel source is embedded and compiled once per backend, at creation.
 // Compiling at load time rather than shipping a .metallib is what keeps the
@@ -408,8 +408,13 @@ static gk_backend_buffer_t gk_metal_buft_alloc(gk_backend_buffer_type_t buft, si
 
     ctx->dev    = dev;
     ctx->size   = size;
-    ctx->shared = true;   // until a discrete device opts into private storage
-    ctx->mtl  = [dev->mtl newBufferWithLength:size options:MTLResourceStorageModeShared];
+    // A discrete GPU has its own memory, so keep the weights there. A
+    // unified-memory device keeps shared storage, where it is the only option
+    // and costs nothing.
+    ctx->shared = !dev->storage_private;
+    ctx->mtl = [dev->mtl newBufferWithLength:size
+                                    options:ctx->shared ? MTLResourceStorageModeShared
+                                                        : MTLResourceStorageModePrivate];
 
     if (ctx->mtl == nil) {
         gk_logf("gk Metal: failed to allocate %zu bytes on %s\n", size, dev->name);
@@ -417,7 +422,13 @@ static gk_backend_buffer_t gk_metal_buft_alloc(gk_backend_buffer_type_t buft, si
         return NULL;
     }
 
-    ctx->base = [ctx->mtl contents];
+    if (ctx->shared) {
+        ctx->base = [ctx->mtl contents];
+    } else {
+        // A unique, never-dereferenced range for gk_metal_resolve to key on.
+        ctx->base = (void *) (uintptr_t) (GK_METAL_SYNTH_BASE + dev->synth);
+        dev->synth += GK_METAL_SYNTH_STRIDE;
+    }
 
     gk_backend_buffer_t buffer = gk_backend_buffer_init(buft, &g_metal_buffer_iface, ctx, size);
     if (buffer == NULL) {
